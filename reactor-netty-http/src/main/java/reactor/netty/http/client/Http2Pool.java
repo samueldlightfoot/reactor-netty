@@ -682,6 +682,9 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	void pendingOffer(Borrower borrower) {
 		ConcurrentLinkedDeque<Borrower> pendingQueue = pending;
 		if (pendingQueue == TERMINATED) {
+			// Pool was disposed concurrently, after doAcquire's isDisposed() check passed. Fail the
+			// borrower rather than leave it neither served nor failed (a silently hung acquire).
+			borrower.fail(new PoolShutdownException());
 			return;
 		}
 
@@ -888,7 +891,14 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				}
 				// ACQUIRED was incremented in drainLoop, rollback
 				ACQUIRED.decrementAndGet(pool);
-				pool.addPending(pool.pending, this, true);
+				ConcurrentLinkedDeque<Borrower> pending = pool.pending;
+				if (pending == TERMINATED) {
+					// Pool was disposed concurrently. Fail rather than re-pend onto the shared static
+					// TERMINATED sentinel deque, which nothing ever drains (borrower stranded forever).
+					fail(new PoolShutdownException());
+					return;
+				}
+				pool.addPending(pending, this, true);
 				return;
 			}
 			stopPendingCountdown(true);

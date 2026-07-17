@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.reactivestreams.Subscription;
+import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -38,6 +39,7 @@ import reactor.netty.internal.shaded.reactor.pool.PoolAcquireTimeoutException;
 import reactor.netty.internal.shaded.reactor.pool.PoolBuilder;
 import reactor.netty.internal.shaded.reactor.pool.PoolConfig;
 import reactor.netty.internal.shaded.reactor.pool.PoolMetricsRecorder;
+import reactor.netty.internal.shaded.reactor.pool.PoolShutdownException;
 import reactor.netty.internal.shaded.reactor.pool.PooledRef;
 import reactor.test.StepVerifier;
 
@@ -2160,6 +2162,108 @@ class Http2PoolTest {
 				ch.finishAndReleaseAll();
 				Connection.from(ch).dispose();
 			}
+		}
+	}
+
+	@Test
+	void pendingOfferOnDisposedPoolFailsBorrower() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(2)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			// Dispose so pending is the static TERMINATED sentinel, then reach pendingOffer directly —
+			// mimics a dispose landing between doAcquire's isDisposed() check and pendingOffer.
+			http2Pool.disposeLater().block(Duration.ofSeconds(1));
+
+			CapturingSubscriber subscriber = new CapturingSubscriber();
+			Http2Pool.Borrower borrower = new Http2Pool.Borrower(subscriber, http2Pool, Duration.ZERO);
+			http2Pool.pendingOffer(borrower);
+
+			assertThat(subscriber.error.get())
+					.as("borrower failed rather than silently dropped")
+					.isInstanceOf(PoolShutdownException.class);
+			assertThat(http2Pool.pendingSize).as("not enqueued").isZero();
+			assertThat(Http2Pool.TERMINATED).as("static sentinel not polluted").doesNotContain(borrower);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void deliverRollbackOnDisposedPoolFailsBorrower() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(1)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			// Acquire the single permitted stream to obtain a slot, then dispose so the slot is retired
+			// and pending is the TERMINATED sentinel.
+			Http2Pool.Http2PooledRef ref =
+					(Http2Pool.Http2PooledRef) http2Pool.acquire().block(Duration.ofSeconds(1));
+			http2Pool.disposeLater().block(Duration.ofSeconds(1));
+
+			// deliver() into the retired slot fails canOpenStream() and takes the rollback branch,
+			// which must fail the borrower rather than re-pend it onto the static TERMINATED sentinel.
+			CapturingSubscriber subscriber = new CapturingSubscriber();
+			Http2Pool.Borrower borrower = new Http2Pool.Borrower(subscriber, http2Pool, Duration.ZERO);
+			borrower.deliver(ref, false);
+
+			assertThat(subscriber.error.get())
+					.as("borrower failed rather than stranded")
+					.isInstanceOf(PoolShutdownException.class);
+			assertThat(http2Pool.pendingSize).as("not re-pended").isZero();
+			assertThat(Http2Pool.TERMINATED).as("static sentinel not polluted").doesNotContain(borrower);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	static final class CapturingSubscriber implements CoreSubscriber<Http2Pool.Http2PooledRef> {
+
+		final AtomicReference<Throwable> error = new AtomicReference<>();
+		final AtomicReference<Http2Pool.Http2PooledRef> value = new AtomicReference<>();
+
+		@Override
+		public void onSubscribe(Subscription s) {
+		}
+
+		@Override
+		public void onNext(Http2Pool.Http2PooledRef ref) {
+			value.set(ref);
+		}
+
+		@Override
+		public void onError(Throwable t) {
+			error.set(t);
+		}
+
+		@Override
+		public void onComplete() {
 		}
 	}
 
