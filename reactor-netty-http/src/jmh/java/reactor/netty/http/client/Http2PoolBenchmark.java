@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.bootstrap.Bootstrap;
@@ -313,5 +314,111 @@ public class Http2PoolBenchmark {
 				          .flatMap(PooledRef::invalidate)
 				          .subscribe(v -> { }, e -> latch.countDown(), latch::countDown));
 		latch.await();
+	}
+
+	/**
+	 * The realistic multi-connection pool: 4 connections on 4 event loops, each multiplexing a
+	 * steady load with headroom (maxConcurrentStreams 100). Rotation spreads concurrent acquires
+	 * across the four connections' loops, so this is where the fast path's WIP-funnel removal plus
+	 * loop-spread should beat the slow path — or, if flat here, it does not earn its complexity.
+	 */
+	@State(Scope.Benchmark)
+	public static class MultiConnPoolState {
+
+		static final int CONNECTIONS = 4;
+		static final int MAX_STREAMS = 100;
+		static final int HELD_PER_CONNECTION = 90; // steady load, leaves 10 streams of headroom
+
+		EventLoopGroup group;
+		Channel server;
+		Http2Pool pool;
+		final List<PooledRef<Connection>> held = new ArrayList<>();
+
+		@Setup(Level.Trial)
+		public void setup() throws Exception {
+			group = new DefaultEventLoopGroup(CONNECTIONS);
+			LocalAddress address = new LocalAddress("http2-pool-multiconn");
+			server = new ServerBootstrap()
+					.group(group)
+					.channel(LocalServerChannel.class)
+					.childHandler(new ChannelHandlerAdapter() {})
+					.bind(address)
+					.sync()
+					.channel();
+
+			// Pre-create one client channel per loop; the allocator hands them out in order.
+			List<Connection> connections = new ArrayList<>();
+			for (int i = 0; i < CONNECTIONS; i++) {
+				Channel channel = new Bootstrap()
+						.group(group)
+						.channel(LocalChannel.class)
+						.handler(new ChannelInitializer<Channel>() {
+							@Override
+							protected void initChannel(Channel ch) {
+								ch.pipeline().addLast(Http2FrameCodecBuilder.forClient().build(),
+										new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+							}
+						})
+						.connect(address)
+						.sync()
+						.channel();
+				channel.eventLoop().submit(() ->
+						channel.pipeline().get(Http2FrameCodec.class)
+						       .connection().local().maxActiveStreams(Integer.MAX_VALUE)).sync();
+				connections.add(Connection.from(channel));
+			}
+
+			AtomicInteger index = new AtomicInteger();
+			Mono<Connection> allocator = Mono.defer(() -> {
+				Connection connection = connections.get(index.getAndIncrement());
+				return Mono.just(connection)
+				           .subscribeOn(Schedulers.fromExecutor(connection.channel().eventLoop()));
+			});
+			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+					.maxConnections(CONNECTIONS)
+					.maxConcurrentStreams(MAX_STREAMS)
+					.build();
+			pool = PoolBuilder.from(allocator)
+					.idleResourceReuseLruOrder()
+					.maxPendingAcquireUnbounded()
+					.sizeBetween(0, CONNECTIONS)
+					.build(config -> new Http2Pool(config, strategy));
+
+			// Fill all four connections to MAX_STREAMS (forces four allocations, in order), then
+			// release the excess so each holds HELD_PER_CONNECTION with headroom for the churn.
+			List<PooledRef<Connection>> all = new ArrayList<>();
+			for (int i = 0; i < CONNECTIONS * MAX_STREAMS; i++) {
+				all.add(pool.acquire().block());
+			}
+			for (int c = 0; c < CONNECTIONS; c++) {
+				for (int s = 0; s < MAX_STREAMS; s++) {
+					PooledRef<Connection> ref = all.get(c * MAX_STREAMS + s);
+					if (s < HELD_PER_CONNECTION) {
+						held.add(ref);
+					}
+					else {
+						ref.invalidate().block();
+					}
+				}
+			}
+		}
+
+		@TearDown(Level.Trial)
+		public void tearDown() throws Exception {
+			for (PooledRef<Connection> ref : held) {
+				ref.invalidate().block();
+			}
+			server.close().sync();
+			group.shutdownGracefully().sync();
+		}
+	}
+
+	@Benchmark
+	@Threads(8)
+	public void acquireReleaseMultiConn(MultiConnPoolState state) {
+		// Eight threads churning acquire+release over four warm, multiplexing connections: rotation
+		// spreads the claims across four loops. The realistic decider for whether the fast path earns
+		// its second acquire entry point.
+		state.pool.acquire().flatMap(PooledRef::invalidate).block();
 	}
 }
