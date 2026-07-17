@@ -19,7 +19,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.bootstrap.Bootstrap;
@@ -327,30 +326,49 @@ public class Http2PoolBenchmark {
 
 		static final int CONNECTIONS = 4;
 		static final int MAX_STREAMS = 100;
-		static final int HELD_PER_CONNECTION = 90; // steady load, leaves 10 streams of headroom
 
-		EventLoopGroup group;
+		EventLoopGroup serverGroup;
+		EventLoopGroup clientGroup;
 		Channel server;
 		Http2Pool pool;
-		final List<PooledRef<Connection>> held = new ArrayList<>();
 
 		@Setup(Level.Trial)
 		public void setup() throws Exception {
-			group = new DefaultEventLoopGroup(CONNECTIONS);
+			serverGroup = new DefaultEventLoopGroup(1);
+			clientGroup = new DefaultEventLoopGroup(CONNECTIONS);
 			LocalAddress address = new LocalAddress("http2-pool-multiconn");
+			// childHandler must be a ChannelInitializer (@Sharable): a bare handler instance reused
+			// across the four accepted child channels throws on the second add and hangs the connect.
 			server = new ServerBootstrap()
-					.group(group)
+					.group(serverGroup)
 					.channel(LocalServerChannel.class)
-					.childHandler(new ChannelHandlerAdapter() {})
+					.childHandler(new ChannelInitializer<Channel>() {
+						@Override
+						protected void initChannel(Channel ch) {
+						}
+					})
 					.bind(address)
 					.sync()
 					.channel();
 
-			// Pre-create one client channel per loop; the allocator hands them out in order.
-			List<Connection> connections = new ArrayList<>();
+			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+					.maxConnections(CONNECTIONS)
+					.maxConcurrentStreams(MAX_STREAMS)
+					.build();
+			// The pool is seeded directly (below), so the allocator is never invoked.
+			pool = PoolBuilder.from(Mono.<Connection>error(new IllegalStateException("unexpected allocation")))
+					.idleResourceReuseLruOrder()
+					.maxPendingAcquireUnbounded()
+					.sizeBetween(0, CONNECTIONS)
+					.build(config -> new Http2Pool(config, strategy));
+
+			// Seed four warm, idle connections directly (each on its own loop): grant the permits,
+			// create a slot per connected channel on its loop, and offer it into the pool. This is a
+			// deterministic stand-in for a pool that has warmed four connections under load.
+			pool.allocationStrategy.getPermits(CONNECTIONS);
 			for (int i = 0; i < CONNECTIONS; i++) {
 				Channel channel = new Bootstrap()
-						.group(group)
+						.group(clientGroup)
 						.channel(LocalChannel.class)
 						.handler(new ChannelInitializer<Channel>() {
 							@Override
@@ -365,51 +383,17 @@ public class Http2PoolBenchmark {
 				channel.eventLoop().submit(() ->
 						channel.pipeline().get(Http2FrameCodec.class)
 						       .connection().local().maxActiveStreams(Integer.MAX_VALUE)).sync();
-				connections.add(Connection.from(channel));
-			}
-
-			AtomicInteger index = new AtomicInteger();
-			Mono<Connection> allocator = Mono.defer(() -> {
-				Connection connection = connections.get(index.getAndIncrement());
-				return Mono.just(connection)
-				           .subscribeOn(Schedulers.fromExecutor(connection.channel().eventLoop()));
-			});
-			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
-					.maxConnections(CONNECTIONS)
-					.maxConcurrentStreams(MAX_STREAMS)
-					.build();
-			pool = PoolBuilder.from(allocator)
-					.idleResourceReuseLruOrder()
-					.maxPendingAcquireUnbounded()
-					.sizeBetween(0, CONNECTIONS)
-					.build(config -> new Http2Pool(config, strategy));
-
-			// Fill all four connections to MAX_STREAMS (forces four allocations, in order), then
-			// release the excess so each holds HELD_PER_CONNECTION with headroom for the churn.
-			List<PooledRef<Connection>> all = new ArrayList<>();
-			for (int i = 0; i < CONNECTIONS * MAX_STREAMS; i++) {
-				all.add(pool.acquire().block());
-			}
-			for (int c = 0; c < CONNECTIONS; c++) {
-				for (int s = 0; s < MAX_STREAMS; s++) {
-					PooledRef<Connection> ref = all.get(c * MAX_STREAMS + s);
-					if (s < HELD_PER_CONNECTION) {
-						held.add(ref);
-					}
-					else {
-						ref.invalidate().block();
-					}
-				}
+				Connection connection = Connection.from(channel);
+				Http2Pool.Slot slot = channel.eventLoop().submit(() -> pool.createSlot(connection)).get();
+				pool.offerSlot(pool.connections, slot);
 			}
 		}
 
 		@TearDown(Level.Trial)
 		public void tearDown() throws Exception {
-			for (PooledRef<Connection> ref : held) {
-				ref.invalidate().block();
-			}
 			server.close().sync();
-			group.shutdownGracefully().sync();
+			clientGroup.shutdownGracefully().sync();
+			serverGroup.shutdownGracefully().sync();
 		}
 	}
 
