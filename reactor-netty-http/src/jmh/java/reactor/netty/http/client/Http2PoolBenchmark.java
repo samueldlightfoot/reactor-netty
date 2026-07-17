@@ -293,6 +293,15 @@ public class Http2PoolBenchmark {
 	}
 
 	@Benchmark
+	@Threads(8)
+	public void acquireReleaseContended(UsedPoolState state) {
+		// Same warm pool, twice the acquiring threads. The slow path serializes every acquire
+		// through the single WIP drainLoop; the fast path lets each thread poll/offer/execute on its
+		// own, so the WIP-funnel removal (the structural win) shows only under this contention.
+		state.pool.acquire().flatMap(PooledRef::invalidate).block();
+	}
+
+	@Benchmark
 	@Threads(1)
 	public void acquireReleaseColocated(UsedPoolState state) throws InterruptedException {
 		// Caller colocated with the connection's event loop: the acquire's drainLoop and the
