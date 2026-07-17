@@ -32,6 +32,7 @@ import java.util.function.Function;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.EventLoop;
+import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2FrameCodec;
 import io.netty.handler.codec.http2.Http2MultiplexHandler;
 import io.netty.handler.ssl.ApplicationProtocolNames;
@@ -48,6 +49,7 @@ import reactor.core.publisher.Operators;
 import reactor.netty.Connection;
 import reactor.netty.FutureMono;
 import reactor.netty.NettyPipeline;
+import reactor.netty.internal.shaded.reactor.pool.AllocationStrategy;
 import reactor.netty.internal.shaded.reactor.pool.InstrumentedPool;
 import reactor.netty.internal.shaded.reactor.pool.PoolAcquirePendingLimitException;
 import reactor.netty.internal.shaded.reactor.pool.PoolAcquireTimeoutException;
@@ -163,6 +165,9 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	final @Nullable BiPredicate<Connection, PooledRefMetadata> evictionPredicate;
 	final long maxIdleTime;
 	final int streamBatchSize;
+	final AllocationStrategy allocationStrategy;
+	final int maxPending;
+	final boolean evictInBackgroundDisabled;
 
 	long lastInteractionTimestamp;
 
@@ -188,6 +193,9 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		this.poolConfig = poolConfig;
 		this.evictionPredicate = evictionPredicate;
 		this.maxIdleTime = maxIdleTime;
+		this.allocationStrategy = poolConfig.allocationStrategy();
+		this.maxPending = poolConfig.maxPending();
+		this.evictInBackgroundDisabled = poolConfig.evictInBackgroundInterval().isZero();
 
 		recordInteractionTimestamp();
 		scheduleEviction();
@@ -210,7 +218,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 
 	@Override
 	public int allocatedSize() {
-		return poolConfig.allocationStrategy().permitGranted();
+		return allocationStrategy.permitGranted();
 	}
 
 	@Override
@@ -337,7 +345,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			removeSlot(ref.slot);
 		}
 		// If there is eviction in background, the background process will remove this connection
-		else if (poolConfig.evictInBackgroundInterval().isZero()) {
+		else if (evictInBackgroundDisabled) {
 			// not active
 			if (!ref.poolable().channel().isActive()) {
 				ref.slot.invalidate();
@@ -379,8 +387,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	}
 
 	void drainLoop() {
-		recordInteractionTimestamp();
-		int maxPending = poolConfig.maxPending();
+		boolean interacted = false;
 
 		for (;;) {
 			@SuppressWarnings("unchecked")
@@ -394,10 +401,11 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			int borrowersCount = pendingSize;
 
 			if (borrowersCount != 0) {
+				interacted = true;
 				// find a connection that can be used for opening a new stream
 				// when cached connections are below minimum connections, then allocate a new connection
 				boolean belowMinConnections = minConnections > 0 &&
-						poolConfig.allocationStrategy().permitGranted() < minConnections;
+						allocationStrategy.permitGranted() < minConnections;
 				boolean enableStrictReuse = strictConnectionReuse || minConnections > 0;
 				int resourcesCount = idleSize;
 				Slot slot = belowMinConnections ? null : findConnection(resources, resourcesCount);
@@ -442,11 +450,11 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				}
 				else {
 					if (enableStrictReuse && !belowMinConnections &&
-							poolConfig.allocationStrategy().permitGranted() > resourcesCount) {
+							allocationStrategy.permitGranted() > resourcesCount) {
 						// connections allocations were triggered
 					}
 					else {
-						int permits = poolConfig.allocationStrategy().getPermits(1);
+						int permits = allocationStrategy.getPermits(1);
 						if (permits <= 0) {
 							if (maxPending >= 0) {
 								borrowersCount = pendingSize;
@@ -462,11 +470,11 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 						else {
 							if (permits > 1) {
 								// warmup is not supported
-								poolConfig.allocationStrategy().returnPermits(permits - 1);
+								allocationStrategy.returnPermits(permits - 1);
 							}
 							Borrower borrower = pollPending(borrowers, true);
 							if (borrower == null || borrower.get()) {
-								poolConfig.allocationStrategy().returnPermits(1);
+								allocationStrategy.returnPermits(1);
 								continue;
 							}
 							if (isDisposed()) {
@@ -489,7 +497,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 									             else if (sig.isOnError()) {
 									                 Throwable error = sig.getThrowable();
 									                 assert error != null;
-									                 poolConfig.allocationStrategy().returnPermits(1);
+									                 allocationStrategy.returnPermits(1);
 									                 borrower.fail(error);
 									             }
 									         })
@@ -502,7 +510,9 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			}
 
 			if (WIP.decrementAndGet(this) == 0) {
-				recordInteractionTimestamp();
+				if (interacted) {
+					recordInteractionTimestamp();
+				}
 				break;
 			}
 		}
@@ -688,7 +698,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		int postOffer = addPending(pendingQueue, borrower, false);
 
 		long estimateStreamsCount = totalMaxConcurrentStreams - acquired;
-		int permits = poolConfig.allocationStrategy().estimatePermitCount();
+		int permits = allocationStrategy.estimatePermitCount();
 		if (permits + estimateStreamsCount < postOffer) {
 			borrower.pendingAcquireStart = clock.millis();
 			if (!borrower.acquireTimeout.isZero() && borrower.timeoutTask == Borrower.TIMEOUT_DISPOSED) {
@@ -700,9 +710,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		}
 
 		if (WIP.getAndIncrement(this) == 0) {
-			int maxPending = poolConfig.maxPending();
-			ConcurrentLinkedQueue<Slot> ir = connections;
-			if (maxPending >= 0 && postOffer > maxPending && ir.isEmpty() && poolConfig.allocationStrategy().estimatePermitCount() == 0) {
+			if (maxPending >= 0 && postOffer > maxPending && connections.isEmpty() && allocationStrategy.estimatePermitCount() == 0) {
 				Borrower toCull = pollPending(pendingQueue, false);
 				if (toCull != null) {
 					pendingAcquireLimitReached(toCull, maxPending);
@@ -778,7 +786,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	}
 
 	void scheduleEviction() {
-		if (!poolConfig.evictInBackgroundInterval().isZero()) {
+		if (!evictInBackgroundDisabled) {
 			long nanosEvictionInterval = poolConfig.evictInBackgroundInterval().toNanos();
 			this.evictionTask = poolConfig.evictInBackgroundScheduler()
 					.schedule(this::evictInBackground, nanosEvictionInterval, TimeUnit.NANOSECONDS);
@@ -990,7 +998,14 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			return Mono.defer(() -> {
 				if (compareAndSet(false, true)) {
 					ACQUIRED.decrementAndGet(slot.pool);
-					return slot.pool.destroyPoolable(this).doFinally(st -> slot.pool.drain());
+					// destroyPoolable is synchronous (returns an already-terminal Mono); run the
+					// follow-up drain in a finally instead of allocating a doFinally per release.
+					try {
+						return slot.pool.destroyPoolable(this);
+					}
+					finally {
+						slot.pool.drain();
+					}
 				}
 				else {
 					return Mono.empty();
@@ -1047,6 +1062,8 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		volatile @Nullable ChannelHandlerContext http2FrameCodecCtx;
 		volatile @Nullable ChannelHandlerContext http2MultiplexHandlerCtx;
 		volatile @Nullable ChannelHandlerContext h2cUpgradeHandlerCtx;
+		volatile @Nullable Http2Connection http2Connection;
+		volatile boolean h2cUpgradeHandlerAbsent;
 
 		// Set on the event loop by Http2ConnectionLiveness when a PING liveness check starts/ends.
 		// Read on the acquire path so the connection is not handed out while it is being probed.
@@ -1089,10 +1106,16 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		private int computeMaxConcurrentStreams() {
 			assert connection.channel().eventLoop().inEventLoop();
 			ChannelHandlerContext frameCodec = http2FrameCodecCtx();
-			if (frameCodec != null && http2MultiplexHandlerCtx() != null) {
-				int maxActiveStreams = ((Http2FrameCodec) frameCodec.handler()).connection().local().maxActiveStreams();
-				return pool.maxConcurrentStreams == -1 ? maxActiveStreams :
-						Math.min(pool.maxConcurrentStreams, maxActiveStreams);
+			if (frameCodec != null) {
+				// Memoize the connection on the event loop so goAwayReceived() can read it off-loop
+				// without re-walking the pipeline.
+				Http2Connection conn = ((Http2FrameCodec) frameCodec.handler()).connection();
+				this.http2Connection = conn;
+				if (http2MultiplexHandlerCtx() != null) {
+					int maxActiveStreams = conn.local().maxActiveStreams();
+					return pool.maxConcurrentStreams == -1 ? maxActiveStreams :
+							Math.min(pool.maxConcurrentStreams, maxActiveStreams);
+				}
 			}
 			return 0;
 		}
@@ -1137,13 +1160,27 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 
 		int decrementConcurrencyAndGet() {
 			int concurrency = CONCURRENCY.decrementAndGet(this);
-			idleTimestamp = pool.clock.millis();
+			// idleTimestamp is only read once the connection is idle (concurrency 0), so only the
+			// release that reaches 0 needs the clock; skip it while other streams remain active.
+			if (concurrency == 0) {
+				idleTimestamp = pool.clock.millis();
+			}
 			return concurrency;
 		}
 
 		boolean goAwayReceived() {
-			ChannelHandlerContext frameCodec = http2FrameCodecCtx();
-			return frameCodec != null && ((Http2FrameCodec) frameCodec.handler()).connection().goAwayReceived();
+			Http2Connection conn = http2Connection;
+			if (conn == null) {
+				// Not yet memoized on the event loop (before the first deliver, or an h2c slot
+				// pre-upgrade / plain HTTP/1.1 slot): resolve once via the pipeline and cache.
+				ChannelHandlerContext frameCodec = http2FrameCodecCtx();
+				if (frameCodec == null) {
+					return false;
+				}
+				conn = ((Http2FrameCodec) frameCodec.handler()).connection();
+				http2Connection = conn;
+			}
+			return conn.goAwayReceived();
 		}
 
 		boolean connectionLivenessCheckInProgress() {
@@ -1173,13 +1210,23 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		}
 
 		@Nullable ChannelHandlerContext h2cUpgradeHandlerCtx() {
+			if (h2cUpgradeHandlerAbsent) {
+				return null;
+			}
 			ChannelHandlerContext ctx = h2cUpgradeHandlerCtx;
 			// ChannelHandlerContext.isRemoved is only meant to be called from within the EventLoop
 			if (ctx != null && connection.channel().eventLoop().inEventLoop() && !ctx.isRemoved()) {
 				return ctx;
 			}
 			ctx = connection.channel().pipeline().context(NettyPipeline.H2CUpgradeHandler);
-			h2cUpgradeHandlerCtx = ctx;
+			if (ctx == null) {
+				// The upgrade handler is added once at channel init and removes itself after the
+				// upgrade; it is never re-added, so a miss is permanent — stop re-walking.
+				h2cUpgradeHandlerAbsent = true;
+			}
+			else {
+				h2cUpgradeHandlerCtx = ctx;
+			}
 			return ctx;
 		}
 
@@ -1192,14 +1239,17 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				if (log.isDebugEnabled()) {
 					log.debug(format(connection.channel(), "Channel removed from pool"));
 				}
-				pool.poolConfig.allocationStrategy().returnPermits(1);
+				pool.allocationStrategy.returnPermits(1);
 				TOTAL_MAX_CONCURRENT_STREAMS.addAndGet(this.pool, -maxConcurrentStreams);
 				maxConcurrentStreams = 0;
 			}
 		}
 
 		boolean isH2cUpgrade() {
-			return h2cUpgradeHandlerCtx() != null && http2MultiplexHandlerCtx() == null;
+			// An h2c upgrade only exists on cleartext connections (no SslHandler, so null ALPN);
+			// TLS connections never carry the upgrade handler, so skip the pipeline lookups.
+			return applicationProtocol == null &&
+					h2cUpgradeHandlerCtx() != null && http2MultiplexHandlerCtx() == null;
 		}
 
 		@Override
