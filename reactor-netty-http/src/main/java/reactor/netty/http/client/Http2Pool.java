@@ -21,6 +21,7 @@ import java.util.Iterator;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -170,6 +171,13 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	final boolean evictInBackgroundDisabled;
 	final BiPredicate<Connection, PooledRefMetadata> resolvedEvictionPredicate;
 	final Runnable drainRunnable;
+	// Kill switch for the fast-acquire path, read from -Dreactor.netty.pool.h2.fastAcquire (default off).
+	final boolean fastAcquireEnabled;
+	// Count of streams served by the fast-acquire path (observability / tests). Multiple connection
+	// loops can serve concurrently, so the increment is atomic.
+	volatile int fastAcquireDelivered;
+	static final AtomicIntegerFieldUpdater<Http2Pool> FAST_ACQUIRE_DELIVERED =
+			AtomicIntegerFieldUpdater.newUpdater(Http2Pool.class, "fastAcquireDelivered");
 
 	long lastInteractionTimestamp;
 
@@ -200,6 +208,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		this.evictInBackgroundDisabled = poolConfig.evictInBackgroundInterval().isZero();
 		this.resolvedEvictionPredicate = evictionPredicate != null ? evictionPredicate : poolConfig.evictionPredicate();
 		this.drainRunnable = this::drain;
+		this.fastAcquireEnabled = Boolean.parseBoolean(System.getProperty("reactor.netty.pool.h2.fastAcquire", "false"));
 
 		recordInteractionTimestamp();
 		scheduleEviction();
@@ -380,8 +389,95 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			return;
 		}
 
+		if (fastAcquire(borrower)) {
+			return;
+		}
+
 		pendingOffer(borrower);
 		drain();
+	}
+
+	// Fast-acquire: for the common warm case, serve an acquire on the connection's event loop in the
+	// hop the request already pays, skipping the pending-queue / drainLoop / WIP machinery. Off by
+	// default (kill switch); only non-strict pools without a minimum are eligible. It rotates the
+	// head connection to the tail (head-poll / tail-offer, the same rotation the slow path performs),
+	// so round-robin spread across connections is preserved. Retirement, contended fairness, and
+	// every case not handled here fall through to the slow path (pendingOffer + drain).
+	@SuppressWarnings("unchecked")
+	boolean fastAcquire(Borrower borrower) {
+		if (!fastAcquireEnabled || strictConnectionReuse || minConnections > 0) {
+			return false;
+		}
+		if (pendingSize != 0) {
+			// Never overtake a waiting borrower, and never rotate the queue while a drain scans it.
+			return false;
+		}
+		ConcurrentLinkedQueue<Slot> resources = CONNECTIONS.get(this);
+		if (resources == null) {
+			return false;
+		}
+		Slot slot = pollSlot(resources);
+		if (slot == null) {
+			return false;
+		}
+		if (slot.get()) {
+			// Retired zombie: drop without re-offering (pollSlot already decremented IDLE_SIZE), the
+			// same accounting findConnection uses for a retired slot.
+			return false;
+		}
+		// Invisibility window: between the poll and this offer the slot is absent from the queue.
+		// Offer it back to the tail BEFORE any check that can fail or throw. That keeps the window to
+		// two adjacent queue ops on one thread — smaller than the slow path's poll-to-deliver hop —
+		// and guarantees any borrower that pends inside it is rescued by fastDeliver's on-loop
+		// pendingSize re-check. Nothing fallible may sit between the poll and this offer.
+		offerSlot(resources, slot);
+		if (slot.maxConcurrentStreams <= 0) {
+			// Non-HTTP/2 (h2c pre-upgrade / HTTP/1.1) slot.
+			return false;
+		}
+		// Advisory pre-checks (same read-then-deliver window findConnection has); the slot is back at
+		// the tail, so a failing check simply leaves it for the slow path's scan. Retiring the
+		// connection stays the slow path's job.
+		if (!slot.connection.channel().isActive() || slot.goAwayReceived()
+				|| slot.connectionLivenessCheckInProgress() || testEvictionPredicate(slot)
+				|| !slot.canOpenStream()) {
+			return false;
+		}
+		try {
+			slot.connection.channel().eventLoop().execute(() -> fastDeliver(borrower, slot));
+		}
+		catch (RejectedExecutionException e) {
+			// Loop terminated; the slot is already safely back in the queue.
+			return false;
+		}
+		return true;
+	}
+
+	void fastDeliver(Borrower borrower, Slot slot) {
+		assert slot.connection.channel().eventLoop().inEventLoop();
+		if (borrower.get()) {
+			// Cancelled while the task was queued.
+			return;
+		}
+		if (isDisposed()) {
+			borrower.fail(new PoolShutdownException());
+			return;
+		}
+		// Re-check on the loop: a waiter that arrived, or capacity that shrank / the slot retiring,
+		// since the off-loop pre-checks. The pendingSize re-check is load-bearing for fairness when
+		// a rolled-back borrower re-pends and frees the stream we were about to take.
+		if (pendingSize != 0 || !slot.canOpenStream()) {
+			// Take the full slow path from the loop -- not doAcquire, to avoid re-entering fastAcquire.
+			pendingOffer(borrower);
+			drain();
+			return;
+		}
+		// Counters before delivering, same order as drainLoop; deliver(…, true) skips deactivate
+		// since the slot never left the queue.
+		ACQUIRED.incrementAndGet(this);
+		slot.incrementConcurrencyAndGet();
+		FAST_ACQUIRE_DELIVERED.incrementAndGet(this);
+		borrower.deliver(new Http2PooledRef(slot), true);
 	}
 
 	void drain() {
@@ -540,9 +636,13 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 								log.debug(format(slot.connection.channel(), "Channel is closed, remove from pool"));
 							}
 							recordInteractionTimestamp();
-							slots.remove();
-							IDLE_SIZE.decrementAndGet(this);
-							slot.invalidate();
+							if (resources.remove(slot)) {
+								// Conditional: if another flow (a fast-acquire rotation window or
+								// removeSlot) already took the slot, skip — decrementing unconditionally
+								// after CLQ's void iterator remove drifts IDLE_SIZE permanently.
+								IDLE_SIZE.decrementAndGet(this);
+								slot.invalidate();
+							}
 							continue;
 						}
 
@@ -551,9 +651,13 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 								log.debug(format(slot.connection.channel(), "Channel received GO_AWAY, remove from pool"));
 							}
 							recordInteractionTimestamp();
-							slots.remove();
-							IDLE_SIZE.decrementAndGet(this);
-							slot.invalidate();
+							if (resources.remove(slot)) {
+								// Conditional: if another flow (a fast-acquire rotation window or
+								// removeSlot) already took the slot, skip — decrementing unconditionally
+								// after CLQ's void iterator remove drifts IDLE_SIZE permanently.
+								IDLE_SIZE.decrementAndGet(this);
+								slot.invalidate();
+							}
 							continue;
 						}
 
@@ -563,9 +667,13 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 							}
 							closeChannel(slot.connection.channel());
 							recordInteractionTimestamp();
-							slots.remove();
-							IDLE_SIZE.decrementAndGet(this);
-							slot.invalidate();
+							if (resources.remove(slot)) {
+								// Conditional: if another flow (a fast-acquire rotation window or
+								// removeSlot) already took the slot, skip — decrementing unconditionally
+								// after CLQ's void iterator remove drifts IDLE_SIZE permanently.
+								IDLE_SIZE.decrementAndGet(this);
+								slot.invalidate();
+							}
 						}
 					}
 				}
@@ -783,6 +891,10 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		ConcurrentLinkedQueue<Slot> q = CONNECTIONS.get(slot.pool);
 		if (q != null && q.remove(slot)) {
 			IDLE_SIZE.decrementAndGet(this);
+			// Retirement counts as interaction: a pool served purely by the fast path never runs a
+			// serving drainLoop, so without this its timestamp goes stale and the pool can be judged
+			// inactive while still in use.
+			recordInteractionTimestamp();
 		}
 	}
 
@@ -897,7 +1009,18 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				}
 				// ACQUIRED was incremented in drainLoop, rollback
 				ACQUIRED.decrementAndGet(pool);
-				pool.addPending(pool.pending, this, true);
+				ConcurrentLinkedDeque<Borrower> pending = pool.pending;
+				if (pending == TERMINATED) {
+					// Pool disposed concurrently: fail rather than strand the borrower on the shared
+					// static TERMINATED sentinel deque, which nothing ever drains.
+					fail(new PoolShutdownException());
+					return;
+				}
+				pool.addPending(pending, this, true);
+				// A fast-path claim reaches this rollback without pendingOffer's trailing drain or
+				// armed timeout, so ensure both: the borrower must be re-served and able to time out.
+				armPendingAcquireTimeout();
+				pool.drain();
 				return;
 			}
 			stopPendingCountdown(true);
@@ -933,6 +1056,21 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		 */
 		boolean setTimeoutTask(Disposable task) {
 			return TIMEOUT_TASK.compareAndSet(this, TIMEOUT_DISPOSED, task);
+		}
+
+		// Arm the pending-acquire timeout if not already armed. Idempotent: pendingOffer arms it
+		// only when the capacity estimate is short, so a borrower re-pended from deliver()'s
+		// rollback (notably a fast-path claim that never ran pendingOffer) can still time out.
+		void armPendingAcquireTimeout() {
+			if (!acquireTimeout.isZero() && timeoutTask == TIMEOUT_DISPOSED) {
+				if (pendingAcquireStart == 0) {
+					pendingAcquireStart = pool.clock.millis();
+				}
+				Disposable task = pool.poolConfig.pendingAcquireTimer().apply(this, acquireTimeout);
+				if (!setTimeoutTask(task)) {
+					task.dispose();
+				}
+			}
 		}
 
 		void stopPendingCountdown(boolean success) {
