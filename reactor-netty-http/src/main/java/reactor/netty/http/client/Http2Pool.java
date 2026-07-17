@@ -168,6 +168,8 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	final AllocationStrategy allocationStrategy;
 	final int maxPending;
 	final boolean evictInBackgroundDisabled;
+	final BiPredicate<Connection, PooledRefMetadata> resolvedEvictionPredicate;
+	final Runnable drainRunnable;
 
 	long lastInteractionTimestamp;
 
@@ -196,6 +198,8 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		this.allocationStrategy = poolConfig.allocationStrategy();
 		this.maxPending = poolConfig.maxPending();
 		this.evictInBackgroundDisabled = poolConfig.evictInBackgroundInterval().isZero();
+		this.resolvedEvictionPredicate = evictionPredicate != null ? evictionPredicate : poolConfig.evictionPredicate();
+		this.drainRunnable = this::drain;
 
 		recordInteractionTimestamp();
 		scheduleEviction();
@@ -410,8 +414,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				int resourcesCount = idleSize;
 				Slot slot = belowMinConnections ? null : findConnection(resources, resourcesCount);
 				if (slot != null) {
-					int available = slot.availableStreams();
-					int batchSize = enableStrictReuse ? Math.min(streamBatchSize, available) : 1;
+					int batchSize = enableStrictReuse ? Math.min(streamBatchSize, slot.availableStreams()) : 1;
 					EventLoop eventLoop = slot.connection.channel().eventLoop();
 					int dispatched = 0;
 
@@ -446,7 +449,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 					if (enableStrictReuse) {
 						slot.deactivate();
 					}
-					eventLoop.execute(this::drain);
+					eventLoop.execute(drainRunnable);
 				}
 				else {
 					if (enableStrictReuse && !belowMinConnections &&
@@ -669,9 +672,7 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 	}
 
 	boolean testEvictionPredicate(Slot slot) {
-		return evictionPredicate == null ?
-				poolConfig.evictionPredicate().test(slot.connection, slot) :
-				evictionPredicate.test(slot.connection, slot);
+		return resolvedEvictionPredicate.test(slot.connection, slot);
 	}
 
 	static void pendingAcquireLimitReached(Borrower borrower, int maxPending) {
@@ -698,8 +699,8 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		int postOffer = addPending(pendingQueue, borrower, false);
 
 		long estimateStreamsCount = totalMaxConcurrentStreams - acquired;
-		int permits = allocationStrategy.estimatePermitCount();
-		if (permits + estimateStreamsCount < postOffer) {
+		if (estimateStreamsCount < postOffer
+				&& allocationStrategy.estimatePermitCount() + estimateStreamsCount < postOffer) {
 			borrower.pendingAcquireStart = clock.millis();
 			if (!borrower.acquireTimeout.isZero() && borrower.timeoutTask == Borrower.TIMEOUT_DISPOSED) {
 				Disposable task = poolConfig.pendingAcquireTimer().apply(borrower, borrower.acquireTimeout);
