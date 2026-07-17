@@ -214,6 +214,26 @@ japicmp {
 	]
 }
 
+// HTTP/2 fast-acquire A/B load harness (not a test). Run the same binary twice, toggling the flag:
+//   ./gradlew :reactor-netty-http:h2Harness -Ph2FastAcquire=false
+//   ./gradlew :reactor-netty-http:h2Harness -Ph2FastAcquire=true
+// Tunables: -Pharness.durationSec, -Pharness.threads, -Pharness.minConn, -Pharness.maxStreams, ...
+task h2Harness(type: JavaExec) {
+	group = 'verification'
+	description = 'HTTP/2 fast-acquire A/B load harness'
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = 'reactor.netty.http.client.Http2FastAcquireHarness'
+	jvmArgs = ['-Xms1g', '-Xmx1g']
+	if (project.hasProperty('h2FastAcquire')) {
+		systemProperty('reactor.netty.pool.h2.fastAcquire', project.property('h2FastAcquire'))
+	}
+	project.properties.each { k, v ->
+		if (k.startsWith('harness.')) {
+			systemProperty(k, v)
+		}
+	}
+}
+
 task noMicrometerTest(type: Test) {
 	testClassesDirs = sourceSets.noMicrometerTest.output.classesDirs
 	classpath = sourceSets.noMicrometerTest.runtimeClasspath
