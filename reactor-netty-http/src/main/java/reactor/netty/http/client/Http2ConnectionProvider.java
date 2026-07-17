@@ -222,14 +222,17 @@ final class Http2ConnectionProvider extends PooledConnectionProvider<Connection>
 		       .addListener(f -> {
 		           if (owner instanceof DisposableAcquire) {
 		               DisposableAcquire da = (DisposableAcquire) owner;
-		               da.pooledRef
-		                 .invalidate()
-		                 .subscribe(null, null, () -> {
-		                     if (log.isDebugEnabled()) {
+		               if (log.isDebugEnabled()) {
+		                   da.pooledRef
+		                     .invalidate()
+		                     .subscribe(null, null, () -> {
 		                         Http2Pool.Http2PooledRef http2PooledRef = http2PooledRef(da.pooledRef);
 		                         logStreamsState(channel, http2PooledRef.slot, "Stream closed");
-		                     }
-		                 });
+		                     });
+		               }
+		               else {
+		                   da.pooledRef.invalidate().subscribe();
+		               }
 		           }
 		       });
 	}
