@@ -17,6 +17,7 @@ package reactor.netty.http.client;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -26,6 +27,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.local.LocalAddress;
@@ -217,6 +219,7 @@ public class Http2PoolBenchmark {
 		EventLoopGroup group;
 		Channel server;
 		Http2Pool pool;
+		EventLoop eventLoop;
 		final List<PooledRef<Connection>> held = new ArrayList<>();
 
 		@Setup(Level.Trial)
@@ -247,6 +250,7 @@ public class Http2PoolBenchmark {
 			channel.eventLoop().submit(() ->
 					channel.pipeline().get(Http2FrameCodec.class)
 					       .connection().local().maxActiveStreams(Integer.MAX_VALUE)).sync();
+			eventLoop = channel.eventLoop();
 
 			Connection connection = Connection.from(channel);
 			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
@@ -286,5 +290,19 @@ public class Http2PoolBenchmark {
 		// Acquire a stream off-loop (drainLoop + findConnection), then deliver + release on the
 		// event loop, while HELD_STREAMS streams stay multiplexed on the connection.
 		state.pool.acquire().flatMap(PooledRef::invalidate).block();
+	}
+
+	@Benchmark
+	@Threads(1)
+	public void acquireReleaseColocated(UsedPoolState state) throws InterruptedException {
+		// Caller colocated with the connection's event loop: the acquire's drainLoop and the
+		// deliver run on that loop thread, so an on-loop fast deliver can skip the self-reschedule
+		// (the R-1 / Shape L target). acquireReleaseUsedPool acquires off-loop, which hides it.
+		CountDownLatch latch = new CountDownLatch(1);
+		state.eventLoop.execute(() ->
+				state.pool.acquire()
+				          .flatMap(PooledRef::invalidate)
+				          .subscribe(v -> { }, e -> latch.countDown(), latch::countDown));
+		latch.await();
 	}
 }
