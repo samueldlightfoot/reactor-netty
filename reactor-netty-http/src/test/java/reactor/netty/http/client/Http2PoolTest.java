@@ -98,8 +98,12 @@ class Http2PoolTest {
 			http2Pool.acquire().subscribe(acquired::add);
 
 			assertThat(acquired).as("second deliver should not have run yet").hasSize(1);
-			assertThat(http2Pool.activeStreams()).as("ACQUIRED: 1 active + 1 from drainLoop").isEqualTo(2);
-			// No pre-reservation in non-strict mode, concurrency stays at 1
+			// Slow path increments ACQUIRED in drainLoop (1 active + 1 pending -> 2); the fast path
+			// defers the increment to fastDeliver on the loop, so it stays at 1 here. Concurrency is
+			// not pre-reserved in non-strict mode either way.
+			boolean fastPath = Boolean.getBoolean("reactor.netty.pool.h2.fastAcquire");
+			assertThat(http2Pool.activeStreams()).as("ACQUIRED: slow path pre-increments, fast path defers")
+					.isEqualTo(fastPath ? 1 : 2);
 			assertThat(slot.concurrency()).as("concurrency not pre-reserved (no strict reuse)").isEqualTo(1);
 
 			// Simulate the remote peer lowering max concurrent streams to 1 (via SETTINGS frame)
@@ -331,8 +335,14 @@ class Http2PoolTest {
 			}
 
 			assertThat(acquired).as("deliver() tasks should not have run yet").isEmpty();
-			assertThat(http2Pool.activeStreams()).as("ACQUIRED pre-reserved for concurrentAcquires borrowers").isEqualTo(concurrentAcquires);
-			assertThat(slot.concurrency()).as("concurrency pre-reserved for concurrentAcquires borrowers").isEqualTo(concurrentAcquires);
+			// The strict slow path pre-reserves ACQUIRED and concurrency in drainLoop; the fast path
+			// (eligible for strict/minConnections pools) defers both to fastDeliver on the loop hop.
+			// The end-state assertions below hold identically for both dispatch paths.
+			boolean fastPath = Boolean.getBoolean("reactor.netty.pool.h2.fastAcquire");
+			assertThat(http2Pool.activeStreams()).as("ACQUIRED: slow path pre-reserves, fast path defers")
+					.isEqualTo(fastPath ? 0 : concurrentAcquires);
+			assertThat(slot.concurrency()).as("concurrency: slow path pre-reserves, fast path defers")
+					.isEqualTo(fastPath ? 0 : concurrentAcquires);
 
 			// Simulate the remote peer lowering max concurrent streams to 1 (via SETTINGS frame)
 			// BEFORE the deliver() tasks run on the event loop.
