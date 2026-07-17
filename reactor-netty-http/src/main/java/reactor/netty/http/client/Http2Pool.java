@@ -399,13 +399,18 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 
 	// Fast-acquire: for the common warm case, serve an acquire on the connection's event loop in the
 	// hop the request already pays, skipping the pending-queue / drainLoop / WIP machinery. Off by
-	// default (kill switch); only non-strict pools without a minimum are eligible. It rotates the
-	// head connection to the tail (head-poll / tail-offer, the same rotation the slow path performs),
-	// so round-robin spread across connections is preserved. Retirement, contended fairness, and
-	// every case not handled here fall through to the slow path (pendingOffer + drain).
+	// default (kill switch). It rotates the head connection to the tail (head-poll / tail-offer, the
+	// same rotation the slow path performs), so round-robin spread across connections is preserved.
+	// Strict-reuse pools are eligible: strict batching is observable only with a pending queue (which
+	// the pendingSize bail below excludes), delivery is already reserve-then-deliver, and every
+	// connection-count decision stays on the slow path. The one strict behaviour the fast path must
+	// not pre-empt is the below-minimum ramp -- reusing a warm slot there would starve the forced
+	// allocation that grows the pool toward its minimum -- so that case is sent slow. Retirement,
+	// contended fairness, and every case not handled here fall through to the slow path.
 	@SuppressWarnings("unchecked")
 	boolean fastAcquire(Borrower borrower) {
-		if (!fastAcquireEnabled || strictConnectionReuse || minConnections > 0) {
+		if (!fastAcquireEnabled
+				|| (minConnections > 0 && allocationStrategy.permitGranted() < minConnections)) {
 			return false;
 		}
 		if (pendingSize != 0) {

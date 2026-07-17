@@ -563,6 +563,281 @@ class Http2PoolFastAcquireTest {
 		}
 	}
 
+	// ---- minConnections: below-minimum ramp guard (Invariant 9) -----------------------------
+
+	@Test
+	void belowMinimumRampUsesSlowPathAndAllocates() {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), 2, 2, 1, 1, true);
+		try {
+			// Warm one connection: the pool is now one below its minimum of two.
+			warmConnections(pool, channels, 1);
+			assertThat(pool.allocatedSize()).isEqualTo(1);
+
+			// The warm connection is idle and could serve this acquire on the fast path, but the ramp
+			// guard must send it slow so the pool grows toward its minimum instead of multiplexing.
+			CapturingSubscriber sub = new CapturingSubscriber();
+			pool.doAcquire(borrower(pool, sub));
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			assertThat(sub.value.get()).isNotNull();
+			assertThat(pool.fastAcquireDelivered).as("below minimum, the fast path is skipped").isZero();
+			assertThat(pool.allocatedSize())
+					.as("a second connection was allocated to reach the minimum").isEqualTo(2);
+
+			sub.value.get().release().block(ONE_SECOND);
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
+	// ---- minConnections: strict round-robin spread equivalence (§3) --------------------------
+
+	@Test
+	void roundRobinSpreadMatchesSlowPathStrict() {
+		// A warmed strict pool (minConnections == maxConnections) must spread streams across its
+		// connections exactly as the slow path does -- strict reuse governs connection growth, not
+		// stream placement. Also asserts every acquire actually engaged the fast path, so a silent
+		// leftover exclusion would be caught rather than masquerading as a pass.
+		List<Integer> fastPath = measureStrictRoundRobinSpread(true);
+		List<Integer> slowPath = measureStrictRoundRobinSpread(false);
+
+		assertThat(fastPath).as("strict fast path spreads uniformly across the 4 warm connections")
+				.containsExactly(ROUNDS, ROUNDS, ROUNDS, ROUNDS);
+		assertThat(fastPath).as("strict fast-path spread matches the slow path").isEqualTo(slowPath);
+	}
+
+	static List<Integer> measureStrictRoundRobinSpread(boolean fastAcquire) {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), CONNECTIONS, CONNECTIONS, 1, 1, fastAcquire);
+		try {
+			warmConnections(pool, channels, CONNECTIONS);
+			assertThat(pool.allocatedSize()).isEqualTo(CONNECTIONS);
+			assertThat(pool.fastAcquireDelivered).as("warm-up ran below the minimum, all slow path").isZero();
+
+			Map<io.netty.channel.Channel, Integer> perConnection = new IdentityHashMap<>();
+			for (int round = 0; round < ROUNDS; round++) {
+				List<CapturingSubscriber> subs = new ArrayList<>();
+				for (int i = 0; i < CONNECTIONS; i++) {
+					CapturingSubscriber sub = new CapturingSubscriber();
+					if (fastAcquire) {
+						pool.fastAcquire(borrower(pool, sub));
+					}
+					else {
+						pool.doAcquire(borrower(pool, sub));
+					}
+					subs.add(sub);
+				}
+				channels.forEach(EmbeddedChannel::runPendingTasks);
+
+				List<PooledRef<Connection>> held = new ArrayList<>();
+				for (CapturingSubscriber sub : subs) {
+					Http2Pool.Http2PooledRef ref = sub.value.get();
+					assertThat(ref).isNotNull();
+					perConnection.merge(ref.poolable().channel(), 1, Integer::sum);
+					held.add(ref);
+				}
+				for (PooledRef<Connection> ref : held) {
+					ref.release().block(ONE_SECOND);
+				}
+				channels.forEach(EmbeddedChannel::runPendingTasks);
+			}
+
+			if (fastAcquire) {
+				assertThat(pool.fastAcquireDelivered)
+						.as("every acquire in a warmed strict pool engaged the fast path")
+						.isEqualTo(CONNECTIONS * ROUNDS);
+			}
+			List<Integer> counts = new ArrayList<>(perConnection.values());
+			Collections.sort(counts);
+			return counts;
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
+	// ---- minConnections: the :551-553 "allocations triggered" skip rescued (§4) ---------------
+
+	@Test
+	void strictWindowRescueBothServed() {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), 1, 1, 2, 1, true);
+		try {
+			warmConnections(pool, channels, 1);
+			assertThat(pool.allocatedSize()).isEqualTo(1);
+
+			// A borrower that pends inside the poll->offer window. In a warmed strict pool the rescuing
+			// drain finds no idle slot yet a permit granted, so it takes the "allocations already
+			// triggered" skip (:551-553) -- not the permit-exhaustion path the non-strict rescue test
+			// hits. The on-loop pendingSize re-check must still rescue it.
+			CapturingSubscriber pending = new CapturingSubscriber();
+			WindowQueue<Http2Pool.Slot> window = installWindowQueue(pool);
+			window.afterFirstPoll = () -> pool.doAcquire(borrower(pool, pending));
+
+			CapturingSubscriber fast = new CapturingSubscriber();
+			boolean fastAccepted = pool.fastAcquire(borrower(pool, fast));
+
+			assertThat(fastAccepted).isTrue();
+			assertThat(pool.pendingSize).isEqualTo(1);
+			assertThat(pool.allocatedSize()).as("skipped with a permit granted, no allocation").isEqualTo(1);
+			assertThat(pending.value.get()).isNull();
+
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			assertThat(pending.value.get()).as("window borrower rescued").isNotNull();
+			assertThat(fast.value.get()).as("fast borrower re-served behind it").isNotNull();
+			assertThat(pool.fastAcquireDelivered).as("fast claim aborted to the slow path").isZero();
+			assertThat(pool.idleSize()).isEqualTo(pool.connections.size());
+
+			pending.value.get().release().block(ONE_SECOND);
+			fast.value.get().release().block(ONE_SECOND);
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
+	// ---- minConnections: window skip then overflow allocation (§5) ----------------------------
+
+	@Test
+	void strictWindowSkipThenOverflowAllocates() {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), 2, 1, 1, 1, true);
+		try {
+			warmConnections(pool, channels, 1);
+			EmbeddedChannel warm = channels.peek();
+			assertThat(pool.allocatedSize()).isEqualTo(1);
+
+			// One borrower pends during the window; the warm connection (max one stream) serves it, and
+			// the fast claim -- re-pended by the on-loop re-check -- overflows into a freshly allocated
+			// second connection once the warm one is saturated. Growth stays the slow path's job.
+			CapturingSubscriber pending = new CapturingSubscriber();
+			WindowQueue<Http2Pool.Slot> window = installWindowQueue(pool);
+			window.afterFirstPoll = () -> pool.doAcquire(borrower(pool, pending));
+
+			CapturingSubscriber fast = new CapturingSubscriber();
+			pool.fastAcquire(borrower(pool, fast));
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			// Both served; one reused the warm connection, the other overflowed into a single freshly
+			// allocated one. Which borrower lands where is pending-queue order, not the invariant.
+			assertThat(pending.value.get()).as("window borrower served").isNotNull();
+			assertThat(fast.value.get()).as("fast borrower served").isNotNull();
+			io.netty.channel.Channel pendingCh = pending.value.get().poolable().channel();
+			io.netty.channel.Channel fastCh = fast.value.get().poolable().channel();
+			assertThat(pendingCh).as("served on two distinct connections").isNotSameAs(fastCh);
+			assertThat(pendingCh == warm || fastCh == warm).as("one reused the warm connection").isTrue();
+			assertThat(pool.allocatedSize()).as("exactly one overflow allocation").isEqualTo(2);
+			assertThat(channels).as("one extra connection allocated").hasSize(2);
+			assertThat(pool.activeStreams()).as("both streams live").isEqualTo(2);
+
+			pending.value.get().release().block(ONE_SECOND);
+			fast.value.get().release().block(ONE_SECOND);
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
+	// ---- minConnections: burst containment + batch dispatch (Invariant 11) --------------------
+
+	@Test
+	void strictBurstStillBatches() {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), 1, 1, 3, 3, true);
+		try {
+			// Saturate the one connection (3 of 3 streams). Filling below capacity legitimately uses
+			// the fast path; the invariant under test is that once borrowers wait, none is overtaken.
+			PooledRef<Connection> s1 = pool.acquire().block(ONE_SECOND);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			CapturingSubscriber s2 = new CapturingSubscriber();
+			CapturingSubscriber s3 = new CapturingSubscriber();
+			pool.doAcquire(borrower(pool, s2));
+			pool.doAcquire(borrower(pool, s3));
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(pool.activeStreams()).isEqualTo(3);
+
+			// Three borrowers queue behind the saturated connection.
+			List<CapturingSubscriber> waiters = new ArrayList<>();
+			for (int i = 0; i < 3; i++) {
+				CapturingSubscriber sub = new CapturingSubscriber();
+				pool.doAcquire(borrower(pool, sub));
+				waiters.add(sub);
+			}
+			assertThat(pool.pendingSize).isEqualTo(3);
+			int deliveredBefore = pool.fastAcquireDelivered;
+
+			// A fourth acquire arrives with three already waiting: it must not overtake them.
+			CapturingSubscriber jumper = new CapturingSubscriber();
+			assertThat(pool.fastAcquire(borrower(pool, jumper)))
+					.as("fast path must not overtake waiting borrowers").isFalse();
+			assertThat(pool.fastAcquireDelivered).isEqualTo(deliveredBefore);
+
+			// Release the three held streams: strict batch dispatch drains the waiters.
+			s1.release().block(ONE_SECOND);
+			s2.value.get().release().block(ONE_SECOND);
+			s3.value.get().release().block(ONE_SECOND);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			for (CapturingSubscriber sub : waiters) {
+				assertThat(sub.value.get()).as("waiter served by batch dispatch").isNotNull();
+			}
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
+	// ---- minConnections: death at the boundary is best-effort (§4) ----------------------------
+
+	@Test
+	void deathAtBoundaryFallsBackAndNextAcquireRamps() {
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+		Http2Pool pool = buildStrictPool(suppliedConnections(channels), 3, 2, 1, 1, true);
+		try {
+			warmConnections(pool, channels, 2);
+			assertThat(pool.allocatedSize()).isEqualTo(2);
+
+			// A fast claim passes the ramp guard, then the other warm connection dies inside its window
+			// -- dropping the pool below minimum. The in-flight claim still delivers (best-effort, not
+			// re-pended); the *next* acquire observes the shortfall and ramps back up.
+			List<Http2Pool.Slot> slots = new ArrayList<>(pool.connections);
+			WindowQueue<Http2Pool.Slot> window = installWindowQueue(pool);
+			Http2Pool.Slot head = window.peek();
+			Http2Pool.Slot other = slots.get(0) == head ? slots.get(1) : slots.get(0);
+			window.beforeFirstOffer = other::invalidate;
+
+			CapturingSubscriber fast = new CapturingSubscriber();
+			boolean accepted = pool.fastAcquire(borrower(pool, fast));
+			assertThat(accepted).isTrue();
+			assertThat(pool.allocatedSize()).as("the other connection's permit was returned").isEqualTo(1);
+
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			assertThat(fast.value.get()).as("in-flight fast claim still delivered").isNotNull();
+			assertThat(fast.value.get().poolable().channel()).isSameAs(head.connection.channel());
+			assertThat(pool.fastAcquireDelivered).isEqualTo(1);
+
+			// The next acquire sees the pool below minimum and ramps.
+			CapturingSubscriber next = new CapturingSubscriber();
+			pool.doAcquire(borrower(pool, next));
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			assertThat(next.value.get()).as("next acquire served").isNotNull();
+			assertThat(pool.allocatedSize()).as("ramped back to the minimum").isEqualTo(2);
+			assertThat(pool.fastAcquireDelivered).as("the ramp acquire used the slow path").isEqualTo(1);
+
+			fast.value.get().release().block(ONE_SECOND);
+			next.value.get().release().block(ONE_SECOND);
+		}
+		finally {
+			cleanup(channels);
+		}
+	}
+
 	// ---- helpers ----------------------------------------------------------------------------
 
 	static EmbeddedChannel newHttp2Channel() {
@@ -596,6 +871,35 @@ class Http2PoolFastAcquireTest {
 			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
 					.maxConnections(maxConnections)
 					.maxConcurrentStreams(maxConcurrentStreams)
+					.build();
+			return poolBuilder.build(config -> new Http2Pool(config, strategy));
+		}
+		finally {
+			if (previous == null) {
+				System.clearProperty(FAST_ACQUIRE_PROP);
+			}
+			else {
+				System.setProperty(FAST_ACQUIRE_PROP, previous);
+			}
+		}
+	}
+
+	static Http2Pool buildStrictPool(Mono<Connection> allocator, int maxConnections, int minConnections,
+			int maxConcurrentStreams, int streamBatchSize, boolean fastAcquire) {
+		String previous = System.getProperty(FAST_ACQUIRE_PROP);
+		System.setProperty(FAST_ACQUIRE_PROP, Boolean.toString(fastAcquire));
+		try {
+			PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+					PoolBuilder.from(allocator)
+					           .idleResourceReuseLruOrder()
+					           .maxPendingAcquireUnbounded()
+					           .sizeBetween(0, maxConnections);
+			// minConnections > 0 force-enables strict connection reuse in the pool.
+			Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+					.maxConnections(maxConnections)
+					.minConnections(minConnections)
+					.maxConcurrentStreams(maxConcurrentStreams)
+					.streamBatchSize(streamBatchSize)
 					.build();
 			return poolBuilder.build(config -> new Http2Pool(config, strategy));
 		}
