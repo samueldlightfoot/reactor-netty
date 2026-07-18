@@ -223,7 +223,9 @@ task h2Harness(type: JavaExec) {
 	description = 'HTTP/2 fast-acquire A/B load harness'
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass = 'reactor.netty.http.client.Http2FastAcquireHarness'
-	jvmArgs = ['-Xms1g', '-Xmx1g']
+	// DebugNonSafepoints lets async-profiler attribute samples to inlined frames, not just
+	// safepoint-poll boundaries — required for a trustworthy per-method flame bucket.
+	jvmArgs = ['-Xms1g', '-Xmx1g', '-XX:+UnlockDiagnosticVMOptions', '-XX:+DebugNonSafepoints']
 	if (project.hasProperty('h2FastAcquire')) {
 		systemProperty('reactor.netty.pool.h2.fastAcquire', project.property('h2FastAcquire'))
 	}
