@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2025 VMware, Inc. or its affiliates, All Rights Reserved.
+ * Copyright (c) 2017-2026 VMware, Inc. or its affiliates, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -215,16 +215,19 @@ public final class AddressUtils {
 			return createUnresolved(NetUtil.LOCALHOST.getHostAddress(), port);
 		}
 
+		// Evaluate the upstream supplier once: re-invoking address.get() re-runs the whole
+		// host/port override chain (each a fresh IP-literal parse) per request on the event loop,
+		// and a dynamic supplier could otherwise return an inconsistent snapshot across the calls.
 		SocketAddress socketAddress = address.get();
 		if (isDomainSocketAddress(socketAddress)) {
 			throw new IllegalArgumentException("Cannot update DomainSocketAddress with post number [" + port + "].");
 		}
 
-		if (!(address.get() instanceof InetSocketAddress)) {
+		if (!(socketAddress instanceof InetSocketAddress)) {
 			return createUnresolved(NetUtil.LOCALHOST.getHostAddress(), port);
 		}
 
-		InetSocketAddress inet = (InetSocketAddress) address.get();
+		InetSocketAddress inet = (InetSocketAddress) socketAddress;
 
 		InetAddress addr = inet.getAddress();
 
