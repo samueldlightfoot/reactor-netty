@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2025 VMware, Inc. or its affiliates, All Rights Reserved.
+ * Copyright (c) 2018-2026 VMware, Inc. or its affiliates, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ public final class ConnectionInfo {
 				int portIndex = header.charAt(0) == '[' ? header.indexOf(':', header.indexOf(']')) : header.indexOf(':');
 				if (portIndex != -1) {
 					hostName = header.substring(0, portIndex);
-					hostPort = Integer.parseInt(header.substring(portIndex + 1));
+					hostPort = parseHostPort(header, portIndex + 1);
 				}
 			}
 		}
@@ -87,6 +87,30 @@ public final class ConnectionInfo {
 			}
 			return connectionInfo;
 		}
+	}
+
+	/**
+	 * Parses the {@code Host} header port starting at {@code offset}, avoiding the throwaway substring that
+	 * {@code Integer.parseInt(header.substring(offset))} allocates on every request. Anything this fast path
+	 * does not handle falls back to {@link Integer#parseInt(String)}, so both the returned value and any
+	 * {@link NumberFormatException} stay identical to parsing the raw substring.
+	 */
+	static int parseHostPort(String header, int offset) {
+		int digits = header.length() - offset;
+		// Five digits is the widest run the accumulator cannot overflow; longer is valid input, just slower
+		if (digits < 1 || digits > 5) {
+			return Integer.parseInt(header.substring(offset));
+		}
+		int port = 0;
+		for (int i = offset; i < header.length(); i++) {
+			int digit = header.charAt(i) - '0';
+			if (digit < 0 || digit > 9) {
+				// Not always an error: parseInt accepts a leading sign, so "+80" and "-80" are values
+				return Integer.parseInt(header.substring(offset));
+			}
+			port = port * 10 + digit;
+		}
+		return port;
 	}
 
 	ConnectionInfo(SocketAddress hostAddress, SocketAddress remoteAddress, boolean secured) {
