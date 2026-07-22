@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2025 VMware, Inc. or its affiliates, All Rights Reserved.
+ * Copyright (c) 2018-2026 VMware, Inc. or its affiliates, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,6 +95,30 @@ class ConnectionInfoTests extends BaseHttpTest {
 
 	static @Nullable BiFunction<ConnectionInfo, HttpRequest, ConnectionInfo> getForwardedHandler(boolean useCustomForwardedHandler) {
 		return useCustomForwardedHandler ? CustomXForwardedHeadersHandler::apply : null;
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"80", "8080", "443", "0", "1", "65535", "65536", "099", "100000",
+			"2147483647", "", "abc", "80x", "8 0", "+80", "-80", "2147483648", "99999999999"})
+	void parseHostPortMatchesIntegerParseInt(String portText) {
+		String header = "host:" + portText;
+		int offset = header.indexOf(':') + 1;
+
+		Integer expected = null;
+		try {
+			expected = Integer.parseInt(header.substring(offset));
+		}
+		catch (NumberFormatException ex) {
+			// parseHostPort must throw the same way for inputs the raw substring parse rejects
+		}
+
+		if (expected == null) {
+			Assertions.assertThatExceptionOfType(NumberFormatException.class)
+					.isThrownBy(() -> ConnectionInfo.parseHostPort(header, offset));
+		}
+		else {
+			assertThat(ConnectionInfo.parseHostPort(header, offset)).isEqualTo(expected.intValue());
+		}
 	}
 
 	@Test

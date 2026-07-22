@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2025 VMware, Inc. or its affiliates, All Rights Reserved.
+ * Copyright (c) 2018-2026 VMware, Inc. or its affiliates, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ public final class ConnectionInfo {
 				int portIndex = header.charAt(0) == '[' ? header.indexOf(':', header.indexOf(']')) : header.indexOf(':');
 				if (portIndex != -1) {
 					hostName = header.substring(0, portIndex);
-					hostPort = Integer.parseInt(header.substring(portIndex + 1));
+					hostPort = parseHostPort(header, portIndex + 1);
 				}
 			}
 		}
@@ -87,6 +87,26 @@ public final class ConnectionInfo {
 			}
 			return connectionInfo;
 		}
+	}
+
+	/**
+	 * Parse the {@code Host} header port starting at {@code offset}, avoiding the throwaway substring that
+	 * {@code Integer.parseInt(header.substring(offset))} allocates on every request. Any input that is not a
+	 * plain in-range run of digits (a sign, a non-digit, empty, or a value above 65535) defers to
+	 * {@link Integer#parseInt(String)} so the returned value and any {@link NumberFormatException} remain
+	 * identical to parsing the raw substring.
+	 */
+	static int parseHostPort(String header, int offset) {
+		int length = header.length();
+		int port = 0;
+		for (int i = offset; i < length; i++) {
+			int digit = header.charAt(i) - '0';
+			if (digit < 0 || digit > 9 || port > 0xFFFF) {
+				return Integer.parseInt(header.substring(offset));
+			}
+			port = port * 10 + digit;
+		}
+		return offset == length ? Integer.parseInt(header.substring(offset)) : port;
 	}
 
 	ConnectionInfo(SocketAddress hostAddress, SocketAddress remoteAddress, boolean secured) {
