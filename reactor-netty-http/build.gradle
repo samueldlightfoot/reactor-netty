@@ -214,6 +214,27 @@ japicmp {
 	]
 }
 
+// HTTP/1.1 client-loop load harness (not a test) for flame-profiling. Run:
+//   ./gradlew :reactor-netty-http:h1Harness -Pharness.durationSec=90 -Pharness.warmupSec=15
+// Attach async-profiler to the forked JVM during the window (h1h-cli-* loop threads).
+// Tunables: -Pharness.threads, -Pharness.maxConn, -Pharness.clientLoops, -Pharness.serverLoops, -Pharness.bodyBytes
+task h1Harness(type: JavaExec) {
+	group = 'verification'
+	description = 'HTTP/1.1 client-loop load harness (flame-profile)'
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = 'reactor.netty.http.client.Http1LoopHarness'
+	// Pin the harness JVM to JDK 17 — a JavaExec otherwise inherits the JDK 8 compile toolchain.
+	javaLauncher = javaToolchains.launcherFor {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	jvmArgs = ['-Xms1g', '-Xmx1g']
+	project.properties.each { k, v ->
+		if (k.startsWith('harness.')) {
+			systemProperty(k, v)
+		}
+	}
+}
+
 task noMicrometerTest(type: Test) {
 	testClassesDirs = sourceSets.noMicrometerTest.output.classesDirs
 	classpath = sourceSets.noMicrometerTest.runtimeClasspath
