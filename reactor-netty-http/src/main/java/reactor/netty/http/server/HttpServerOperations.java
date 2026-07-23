@@ -131,7 +131,7 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 	final ConnectionInfo connectionInfo;
 	final ServerCookieDecoder cookieDecoder;
 	final ServerCookieEncoder cookieEncoder;
-	final ServerCookies cookieHolder;
+	@Nullable ServerCookies cookieHolder;
 	final HttpServerFormDecoderProvider formDecoderProvider;
 	final String http2ExtendedConnectProtocol;
 	final boolean is100ContinueExpected;
@@ -214,7 +214,6 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 		this.connectionInfo = connectionInfo;
 		this.cookieDecoder = decoder;
 		this.cookieEncoder = encoder;
-		this.cookieHolder = ServerCookies.newServerRequestHolder(nettyRequest.headers(), decoder);
 		this.currentContext = Context.empty();
 		this.formDecoderProvider = formDecoderProvider;
 		this.is100ContinueExpected = nettyRequest.headers().get(HttpHeaderNames.EXPECT) != null &&
@@ -338,16 +337,23 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 
 	@Override
 	public Map<CharSequence, Set<Cookie>> cookies() {
-		if (cookieHolder != null) {
-			return cookieHolder.getCachedCookies();
-		}
-		throw new IllegalStateException("request not parsed");
+		return cookieHolder().getCachedCookies();
 	}
 
 	@Override
 	public Map<CharSequence, List<Cookie>> allCookies() {
-		if (cookieHolder != null) {
-			return cookieHolder.getAllCachedCookies();
+		return cookieHolder().getAllCachedCookies();
+	}
+
+	// Most requests never read cookies, so defer the per-request holder allocation to first access.
+	ServerCookies cookieHolder() {
+		if (nettyRequest != null) {
+			ServerCookies holder = cookieHolder;
+			if (holder == null) {
+				holder = ServerCookies.newServerRequestHolder(nettyRequest.headers(), cookieDecoder);
+				cookieHolder = holder;
+			}
+			return holder;
 		}
 		throw new IllegalStateException("request not parsed");
 	}
