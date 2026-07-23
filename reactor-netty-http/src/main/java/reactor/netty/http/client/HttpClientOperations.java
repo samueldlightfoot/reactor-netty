@@ -113,7 +113,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 	final HttpHeaders            requestHeaders;
 	final ClientCookieEncoder    cookieEncoder;
 	final ClientCookieDecoder    cookieDecoder;
-	final List<Cookie>           cookieList;
+	@Nullable List<Cookie>       cookieList;
 	final Sinks.One<HttpHeaders> trailerHeaders;
 	final HttpVersion            version;
 
@@ -217,7 +217,6 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 		this.requestHeaders = nettyRequest.headers();
 		this.cookieDecoder = decoder;
 		this.cookieEncoder = encoder;
-		this.cookieList = new ArrayList<>();
 		this.version = initHttpVersion(c);
 		this.trailerHeaders = Sinks.unsafe().one();
 	}
@@ -240,7 +239,11 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 	public HttpClientRequest addCookie(Cookie cookie) {
 		if (!hasSentHeaders()) {
 			this.cookieEncoder.encode(cookie);
-			this.cookieList.add(cookie);
+			List<Cookie> cookieList = this.cookieList;
+			if (cookieList == null) {
+				this.cookieList = cookieList = new ArrayList<>(4);
+			}
+			cookieList.add(cookie);
 		}
 		else {
 			throw new IllegalStateException("Status and headers already sent");
@@ -709,7 +712,8 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 			}
 		}
 
-		if (!cookieList.isEmpty()) {
+		List<Cookie> cookieList = this.cookieList;
+		if (cookieList != null && !cookieList.isEmpty()) {
 			requestHeaders.add(HttpHeaderNames.COOKIE, cookieEncoder.encode(cookieList));
 		}
 	}
