@@ -52,6 +52,7 @@ import io.netty.handler.codec.http.DefaultHttpHeadersFactory;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
+import io.netty.handler.codec.http.EmptyHttpHeaders;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpContent;
@@ -244,7 +245,11 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 		this.readTimeout = readTimeout;
 		this.requestTimeout = requestTimeout;
 		this.responseHeaders = nettyResponse.headers();
-		this.responseHeaders.add(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+		// HTTP/2 and HTTP/3 have no chunked transfer coding; the header would be stripped as hop-by-hop
+		// on the way to the wire, so only HTTP/1.x needs the default.
+		if (!isHttp2) {
+			this.responseHeaders.add(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+		}
 		this.scheme = secured ? "https" : "http";
 		this.timestamp = timestamp;
 		this.validateHeaders = validateHeaders;
@@ -1122,7 +1127,7 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 
 		HttpHeaders trailerHeaders = prepareTrailerHeaders();
 		return new DefaultFullHttpResponse(version(), status(), body, responseHeaders,
-				trailerHeaders != null ? trailerHeaders : resolvedTrailersFactory.newHeaders());
+				trailerHeaders != null ? trailerHeaders : EmptyHttpHeaders.INSTANCE);
 	}
 
 	static long requestsCounter(Channel channel) {
