@@ -273,9 +273,6 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 
 	@Override
 	protected HttpMessage newFullBodyMessage(ByteBuf body) {
-		FullHttpResponse res =
-				new DefaultFullHttpResponse(version(), status(), body, resolvedHeadersFactory, resolvedTrailersFactory);
-
 		if (!HttpMethod.HEAD.equals(method())) {
 			responseHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
 			int code = status().code();
@@ -299,13 +296,12 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 			responseHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
 		}
 
-		res.headers().set(responseHeaders);
-
+		// Share responseHeaders directly, rather than building a second header map and copying every
+		// entry into it, and use the empty-headers singleton for the absent-trailers case (mirrors
+		// newFullHttpResponse).
 		HttpHeaders trailerHeaders = prepareTrailerHeaders();
-		if (trailerHeaders != null) {
-			res.trailingHeaders().set(trailerHeaders);
-		}
-		return res;
+		return new DefaultFullHttpResponse(version(), status(), body, responseHeaders,
+				trailerHeaders != null ? trailerHeaders : EmptyHttpHeaders.INSTANCE);
 	}
 
 	@Override
