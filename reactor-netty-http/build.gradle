@@ -215,6 +215,26 @@ japicmp {
 	]
 }
 
+// HTTP/2 (H2C) client-loop throughput harness (not a test) for A/B'ing Http2Pool changes end-to-end. Run:
+//   ./gradlew :reactor-netty-http:h2Harness -Pharness.durationSec=30 -Pharness.warmupSec=10
+// Tunables: -Pharness.threads, -Pharness.minConn, -Pharness.maxConn, -Pharness.maxStreams, -Pharness.clientLoops, ...
+task h2Harness(type: JavaExec) {
+	group = 'verification'
+	description = 'HTTP/2 (H2C) client-loop throughput harness (A/B Http2Pool)'
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = 'reactor.netty.http.client.Http2LoopHarness'
+	// Pin the harness JVM to JDK 17 — a JavaExec otherwise inherits the JDK 8 compile toolchain.
+	javaLauncher = javaToolchains.launcherFor {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	jvmArgs = ['-Xms1g', '-Xmx1g']
+	project.properties.each { k, v ->
+		if (k.startsWith('harness.')) {
+			systemProperty(k, v)
+		}
+	}
+}
+
 task noMicrometerTest(type: Test) {
 	testClassesDirs = sourceSets.noMicrometerTest.output.classesDirs
 	classpath = sourceSets.noMicrometerTest.runtimeClasspath
