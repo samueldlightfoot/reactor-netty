@@ -24,6 +24,7 @@ import java.util.Properties;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.netty.resolver.AddressResolverGroup;
@@ -243,7 +244,7 @@ public abstract class ClientTransport<T extends ClientTransport<T, CONF>,
 	 */
 	public T host(String host) {
 		Objects.requireNonNull(host, "host");
-		return remoteAddress(() -> AddressUtils.updateHost(configuration().remoteAddress(), host));
+		return updateRemoteAddress(address -> AddressUtils.updateHost(address, host));
 	}
 
 	/**
@@ -276,7 +277,7 @@ public abstract class ClientTransport<T extends ClientTransport<T, CONF>,
 	 * @return a new {@link ClientTransport} reference
 	 */
 	public T port(int port) {
-		return remoteAddress(() -> AddressUtils.updatePort(configuration().remoteAddress(), port));
+		return updateRemoteAddress(address -> AddressUtils.updatePort(address, port));
 	}
 
 	/**
@@ -365,6 +366,25 @@ public abstract class ClientTransport<T extends ClientTransport<T, CONF>,
 		T dup = duplicate();
 		dup.configuration().remoteAddress = remoteAddressSupplier;
 		return dup;
+	}
+
+	/**
+	 * Derive a new remote address from the configured one.
+	 * <p>The result is derived once, here, when it can only ever have one value; a user-provided
+	 * supplier may return a different address on every call, so it stays deferred and is re-applied on
+	 * each subscribe, which is what lets a retry reach a different address.
+	 */
+	private T updateRemoteAddress(Function<Supplier<? extends SocketAddress>, SocketAddress> update) {
+		Supplier<? extends SocketAddress> current = configuration().remoteAddress();
+		if (current instanceof AddressUtils.ConstantAddressSupplier) {
+			try {
+				return remoteAddress(AddressUtils.constant(update.apply(current)));
+			}
+			catch (RuntimeException e) {
+				// Rejected input: defer, so it still surfaces on subscribe rather than here.
+			}
+		}
+		return remoteAddress(() -> update.apply(configuration().remoteAddress()));
 	}
 
 	/**

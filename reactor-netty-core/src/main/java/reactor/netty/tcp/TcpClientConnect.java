@@ -37,7 +37,7 @@ final class TcpClientConnect extends TcpClient {
 		this.config = new TcpClientConfig(
 				provider,
 				Collections.singletonMap(ChannelOption.AUTO_READ, false),
-				() -> AddressUtils.createUnresolved(NetUtil.LOCALHOST.getHostAddress(), DEFAULT_PORT));
+				AddressUtils.constant(AddressUtils.createUnresolved(NetUtil.LOCALHOST.getHostAddress(), DEFAULT_PORT)));
 	}
 	// end::snippet-code[]
 

@@ -233,6 +233,20 @@ public final class AddressUtils {
 		return createUnresolved(host, port);
 	}
 
+	/**
+	 * Return a supplier that always returns the given address.
+	 * <p>The returned supplier marks the address as invariant, which lets
+	 * {@link ClientTransport#host(String)} and {@link ClientTransport#port(int)} derive the updated
+	 * address once, when the client is configured, rather than on every subscribe.
+	 *
+	 * @param address the address to always return
+	 * @return a supplier that always returns the given address
+	 * @since 1.4.0
+	 */
+	public static Supplier<SocketAddress> constant(SocketAddress address) {
+		return new ConstantAddressSupplier(requireNonNull(address, "address"));
+	}
+
 	static @Nullable InetAddress attemptParsingIpString(String hostname) {
 		byte[] ipAddressBytes = NetUtil.createByteArrayFromIpAddressString(hostname);
 
@@ -259,6 +273,30 @@ public final class AddressUtils {
 			return new InetSocketAddress(inetAddressForIpString, port);
 		}
 		return null;
+	}
+
+	/**
+	 * Marks an address as invariant so that it can be derived eagerly. Only suppliers of this type may
+	 * be evaluated ahead of subscribe time; a user-provided supplier may return a different address on
+	 * every call and must not be.
+	 */
+	static final class ConstantAddressSupplier implements Supplier<SocketAddress> {
+
+		final SocketAddress address;
+
+		ConstantAddressSupplier(SocketAddress address) {
+			this.address = address;
+		}
+
+		@Override
+		public SocketAddress get() {
+			return address;
+		}
+
+		@Override
+		public String toString() {
+			return address.toString();
+		}
 	}
 
 }

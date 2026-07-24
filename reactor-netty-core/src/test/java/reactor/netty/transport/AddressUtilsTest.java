@@ -280,6 +280,41 @@ class AddressUtilsTest {
 	}
 
 	@Test
+	void updateHostEvaluatesSupplierOnce() {
+		AtomicInteger evaluations = new AtomicInteger();
+		Supplier<SocketAddress> supplier = () -> {
+			evaluations.incrementAndGet();
+			return AddressUtils.createUnresolved("example.com", 8080);
+		};
+
+		SocketAddress updated = AddressUtils.updateHost(supplier, "other.example.com");
+
+		assertThat(evaluations).hasValue(1);
+		assertThat(updated).isInstanceOf(InetSocketAddress.class);
+		assertThat(((InetSocketAddress) updated).getHostString()).isEqualTo("other.example.com");
+		assertThat(((InetSocketAddress) updated).getPort()).isEqualTo(8080);
+	}
+
+	@Test
+	void constantAlwaysReturnsTheSameAddress() {
+		InetSocketAddress address = AddressUtils.createUnresolved("example.com", 8080);
+		Supplier<SocketAddress> supplier = AddressUtils.constant(address);
+
+		assertThat(supplier.get()).isSameAs(address);
+		assertThat(supplier.get()).isSameAs(address);
+		assertThat(supplier).hasToString(address.toString());
+	}
+
+	@Test
+	@SuppressWarnings("NullAway")
+	void constantRejectsNullAddress() {
+		assertThatExceptionOfType(NullPointerException.class)
+				// Deliberately suppress "NullAway" for testing purposes
+				.isThrownBy(() -> AddressUtils.constant(null))
+				.withMessage("address");
+	}
+
+	@Test
 	void updatePortEvaluatesSupplierOnce() {
 		AtomicInteger evaluations = new AtomicInteger();
 		Supplier<SocketAddress> supplier = () -> {

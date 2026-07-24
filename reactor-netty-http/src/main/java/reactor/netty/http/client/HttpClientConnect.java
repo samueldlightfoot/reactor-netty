@@ -85,7 +85,7 @@ class HttpClientConnect extends HttpClient {
 		this.config = new HttpClientConfig(
 				provider,
 				Collections.singletonMap(ChannelOption.AUTO_READ, false),
-				() -> AddressUtils.createUnresolved(NetUtil.LOCALHOST.getHostAddress(), DEFAULT_PORT));
+				AddressUtils.constant(AddressUtils.createUnresolved(NetUtil.LOCALHOST.getHostAddress(), DEFAULT_PORT)));
 	}
 
 	HttpClientConnect(HttpClientConfig config) {
