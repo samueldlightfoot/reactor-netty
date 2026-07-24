@@ -997,7 +997,14 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			return Mono.defer(() -> {
 				if (compareAndSet(false, true)) {
 					ACQUIRED.decrementAndGet(slot.pool);
-					return slot.pool.destroyPoolable(this).doFinally(st -> slot.pool.drain());
+					// destroyPoolable is synchronous (returns an already-terminal Mono); run the
+					// follow-up drain in a finally instead of allocating a doFinally per release.
+					try {
+						return slot.pool.destroyPoolable(this);
+					}
+					finally {
+						slot.pool.drain();
+					}
 				}
 				else {
 					return Mono.empty();
