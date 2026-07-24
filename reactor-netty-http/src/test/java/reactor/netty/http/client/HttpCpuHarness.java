@@ -15,6 +15,7 @@
  */
 package reactor.netty.http.client;
 
+import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -125,6 +126,17 @@ public final class HttpCpuHarness {
 		}
 		HttpClient client = clientBuilder;
 
+		// Which uri() overload a caller uses decides which per-request address work it pays for:
+		//   relative       - resolves the address through the configured Supplier chain
+		//   absoluteString - UriEndpointFactory's regex branch, then a per-request address parse
+		//   absoluteUri    - java.net.URI accessors (no regex), then the same per-request address parse
+		// Spring WebFlux sends absoluteUri on 6.0.5+, absoluteString on 5.3.x/<=6.0.4.
+		String uriMode = System.getProperty("harness.uriMode", "relative").trim();
+		String absoluteUrl = (tls ? "https" : "http") + "://127.0.0.1:" + server.port() + "/";
+		boolean uriObject = uriMode.equals("absoluteUri");
+		String requestUri = uriMode.startsWith("absolute") ? absoluteUrl : "/";
+		URI requestUriObject = URI.create(absoluteUrl);
+
 		AtomicLong measured = new AtomicLong();
 		AtomicLong total = new AtomicLong();
 		AtomicLong errors = new AtomicLong();
@@ -138,7 +150,7 @@ public final class HttpCpuHarness {
 			// No request ever parks a driver thread, so the loop never pays the per-request unpark it
 			// pays under .block() (a load-generator artifact, not client work). Same offered concurrency
 			// as the blocking driver, so the two modes are apples-to-apples.
-			Mono<Integer> oneReq = client.get().uri("/").responseContent().aggregate()
+			Mono<Integer> oneReq = (uriObject ? client.get().uri(requestUriObject) : client.get().uri(requestUri)).responseContent().aggregate()
 					.map(buf -> {
 						int n = buf.readableBytes();
 						buf.release();
@@ -156,7 +168,7 @@ public final class HttpCpuHarness {
 					started.countDown();
 					while (volatileHolder.running) {
 						try {
-							client.get().uri("/").responseContent().aggregate().block(Duration.ofSeconds(5));
+							(uriObject ? client.get().uri(requestUriObject) : client.get().uri(requestUri)).responseContent().aggregate().block(Duration.ofSeconds(5));
 							total.incrementAndGet();
 							if (volatileHolder.counting) {
 								measured.incrementAndGet();
@@ -175,10 +187,10 @@ public final class HttpCpuHarness {
 		}
 
 		int reportConn = h2 ? h2MaxConn : h1MaxConn;
-		System.out.printf("harness up: protocol=%s tls=%b mode=%s threads=%d conn=%d maxStreams=%s clientLoops=%d " +
+		System.out.printf("harness up: protocol=%s tls=%b mode=%s uri=%s threads=%d conn=%d maxStreams=%s clientLoops=%d " +
 						"serverLoops=%d bodyBytes=%d warmup=%ds window=%ds — attach async-profiler now " +
 						"(cpuh-cli-* / cpuh-srv-* loop threads)%n",
-				proto, tls, async ? "async" : "block", threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
+				proto, tls, async ? "async" : "block", uriMode, threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
 				clientLoops, serverLoopCount, bodyBytes, warmupSec, durationSec);
 
 		Thread.sleep(warmupSec * 1000L);
