@@ -32,6 +32,7 @@ import reactor.netty.Connection;
 import reactor.netty.channel.ChannelMetricsRecorder;
 import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.resources.LoopResources;
+import reactor.netty.tcp.TcpClient;
 
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -44,6 +45,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -248,6 +250,52 @@ class ClientTransportTest {
 		assertThat(configuration2.proxyProvider).isNull();
 		assertThat(configuration2.proxyProviderSupplier).isNull();
 		assertThat(configuration2.resolver()).isNull();
+	}
+
+	@Test
+	void testHostAndPortAreDerivedOnceWhenAddressIsConstant() {
+		Supplier<? extends SocketAddress> remoteAddress =
+				TcpClient.create().host("example.com").port(8080).configuration().remoteAddress();
+
+		assertThat(remoteAddress).isInstanceOf(AddressUtils.ConstantAddressSupplier.class);
+		assertThat(remoteAddress.get()).isSameAs(remoteAddress.get());
+		assertThat(remoteAddress.get()).isEqualTo(InetSocketAddress.createUnresolved("example.com", 8080));
+	}
+
+	@Test
+	void testHostAndPortCanBeConfiguredInAnyOrder() {
+		SocketAddress hostThenPort =
+				TcpClient.create().host("example.com").port(8080).configuration().remoteAddress().get();
+		SocketAddress portThenHost =
+				TcpClient.create().port(8080).host("example.com").configuration().remoteAddress().get();
+
+		assertThat(hostThenPort).isEqualTo(portThenHost)
+				.isEqualTo(InetSocketAddress.createUnresolved("example.com", 8080));
+	}
+
+	@Test
+	void testCustomAddressSupplierIsEvaluatedOnEveryInvocation() {
+		AtomicInteger evaluations = new AtomicInteger();
+		Supplier<? extends SocketAddress> remoteAddress =
+				TcpClient.create()
+				         .remoteAddress(() -> InetSocketAddress.createUnresolved("host" + evaluations.incrementAndGet(), 80))
+				         .port(8080)
+				         .configuration()
+				         .remoteAddress();
+
+		assertThat(remoteAddress).isNotInstanceOf(AddressUtils.ConstantAddressSupplier.class);
+		assertThat(remoteAddress.get()).isEqualTo(InetSocketAddress.createUnresolved("host1", 8080));
+		assertThat(remoteAddress.get()).isEqualTo(InetSocketAddress.createUnresolved("host2", 8080));
+	}
+
+	@Test
+	void testInvalidPortIsRejectedWhenTheAddressIsEvaluated() {
+		Supplier<? extends SocketAddress> remoteAddress =
+				TcpClient.create().port(-1).configuration().remoteAddress();
+
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(remoteAddress::get)
+				.withMessage("port out of range:-1");
 	}
 
 	static TestClientTransport createTestTransportForProxy() {

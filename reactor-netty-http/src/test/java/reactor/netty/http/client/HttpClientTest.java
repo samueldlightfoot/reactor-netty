@@ -57,6 +57,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.net.ssl.SSLException;
 
@@ -4318,6 +4319,15 @@ class HttpClientTest extends BaseHttpTest {
 		finally {
 			server2.disposeNow();
 		}
+	}
+
+	@Test
+	void testRemoteAddressIsDerivedOnceWhenHostAndPortAreConfigured() {
+		Supplier<? extends SocketAddress> remoteAddress =
+				HttpClient.create().host("example.com").port(8080).configuration().remoteAddress();
+
+		assertThat(remoteAddress.get()).isSameAs(remoteAddress.get())
+				.isEqualTo(InetSocketAddress.createUnresolved("example.com", 8080));
 	}
 
 	@ParameterizedTest
