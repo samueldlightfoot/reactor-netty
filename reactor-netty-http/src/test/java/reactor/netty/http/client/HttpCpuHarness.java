@@ -61,6 +61,8 @@ public final class HttpCpuHarness {
 		int bodyBytes = intProp("harness.bodyBytes", 16);
 		String protocol = System.getProperty("harness.protocol", "H2").trim().toUpperCase();
 		boolean tls = boolProp("harness.tls", true);
+		String mode = System.getProperty("harness.mode", "block").trim().toLowerCase();
+		boolean async = mode.equals("async") || mode.equals("subscribe");
 		boolean h2 = protocol.startsWith("H2");
 		// H2: natural multiplexed shape (few conns × many streams). H1: one warm conn per thread (no
 		// pool starvation at this thread count), so throughput reflects CPU/req, not acquire waiting.
@@ -130,34 +132,53 @@ public final class HttpCpuHarness {
 		volatileHolder.counting = false;
 
 		List<Thread> drivers = new ArrayList<>();
-		CountDownLatch started = new CountDownLatch(threads);
-		for (int i = 0; i < threads; i++) {
-			Thread t = new Thread(() -> {
-				started.countDown();
-				while (volatileHolder.running) {
-					try {
-						client.get().uri("/").responseContent().aggregate().block(Duration.ofSeconds(5));
-						total.incrementAndGet();
-						if (volatileHolder.counting) {
-							measured.incrementAndGet();
+		if (async) {
+			// Non-blocking driver: hold a fixed in-flight window of `threads` requests, each response
+			// re-subscribing the next one from its completion callback — which runs on the client loop.
+			// No request ever parks a driver thread, so the loop never pays the per-request unpark it
+			// pays under .block() (a load-generator artifact, not client work). Same offered concurrency
+			// as the blocking driver, so the two modes are apples-to-apples.
+			Mono<Integer> oneReq = client.get().uri("/").responseContent().aggregate()
+					.map(buf -> {
+						int n = buf.readableBytes();
+						buf.release();
+						return n;
+					});
+			AsyncDriver driver = new AsyncDriver(oneReq, total, measured, errors, volatileHolder);
+			for (int i = 0; i < threads; i++) {
+				driver.fire();
+			}
+		}
+		else {
+			CountDownLatch started = new CountDownLatch(threads);
+			for (int i = 0; i < threads; i++) {
+				Thread t = new Thread(() -> {
+					started.countDown();
+					while (volatileHolder.running) {
+						try {
+							client.get().uri("/").responseContent().aggregate().block(Duration.ofSeconds(5));
+							total.incrementAndGet();
+							if (volatileHolder.counting) {
+								measured.incrementAndGet();
+							}
+						}
+						catch (Throwable ex) {
+							errors.incrementAndGet();
 						}
 					}
-					catch (Throwable ex) {
-						errors.incrementAndGet();
-					}
-				}
-			}, "cpuh-driver-" + i);
-			t.setDaemon(true);
-			drivers.add(t);
-			t.start();
+				}, "cpuh-driver-" + i);
+				t.setDaemon(true);
+				drivers.add(t);
+				t.start();
+			}
+			started.await();
 		}
-		started.await();
 
 		int reportConn = h2 ? h2MaxConn : h1MaxConn;
-		System.out.printf("harness up: protocol=%s tls=%b threads=%d conn=%d maxStreams=%s clientLoops=%d " +
+		System.out.printf("harness up: protocol=%s tls=%b mode=%s threads=%d conn=%d maxStreams=%s clientLoops=%d " +
 						"serverLoops=%d bodyBytes=%d warmup=%ds window=%ds — attach async-profiler now " +
 						"(cpuh-cli-* / cpuh-srv-* loop threads)%n",
-				proto, tls, threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
+				proto, tls, async ? "async" : "block", threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
 				clientLoops, serverLoopCount, bodyBytes, warmupSec, durationSec);
 
 		Thread.sleep(warmupSec * 1000L);
@@ -177,8 +198,8 @@ public final class HttpCpuHarness {
 		double meanLatencyUs = throughput > 0 ? (threads / throughput) * 1_000_000.0 : Double.NaN;
 
 		System.out.println("==== HttpCpuHarness ====");
-		System.out.printf("protocol=%s tls=%b conn=%d maxStreams=%s threads=%d clientLoops=%d serverLoops=%d bodyBytes=%d%n",
-				proto, tls, reportConn, h2 ? String.valueOf(maxStreams) : "n/a", threads, clientLoops, serverLoopCount, bodyBytes);
+		System.out.printf("protocol=%s tls=%b mode=%s conn=%d maxStreams=%s threads=%d clientLoops=%d serverLoops=%d bodyBytes=%d%n",
+				proto, tls, async ? "async" : "block", reportConn, h2 ? String.valueOf(maxStreams) : "n/a", threads, clientLoops, serverLoopCount, bodyBytes);
 		System.out.printf("window=%.1fs  requests(window)=%d  errors=%d%n", seconds, window, errors.get());
 		System.out.printf("throughput   = %,.0f req/s%n", throughput);
 		System.out.printf("meanLatency  ~ %.1f us  (Little's law: threads / throughput)%n", meanLatencyUs);
@@ -193,6 +214,43 @@ public final class HttpCpuHarness {
 	static final class Flags {
 		volatile boolean running;
 		volatile boolean counting;
+	}
+
+	// One non-blocking in-flight slot: subscribe, and on the terminal signal re-subscribe the next
+	// request from the callback (which fires on the client loop), keeping the in-flight window constant
+	// without a driver thread ever parking. `subscribe()` returns before the async response arrives, so
+	// re-firing from the callback does not grow the stack.
+	static final class AsyncDriver {
+		final Mono<Integer> req;
+		final AtomicLong total;
+		final AtomicLong measured;
+		final AtomicLong errors;
+		final Flags flags;
+
+		AsyncDriver(Mono<Integer> req, AtomicLong total, AtomicLong measured, AtomicLong errors, Flags flags) {
+			this.req = req;
+			this.total = total;
+			this.measured = measured;
+			this.errors = errors;
+			this.flags = flags;
+		}
+
+		void fire() {
+			req.subscribe(n -> {
+				total.incrementAndGet();
+				if (flags.counting) {
+					measured.incrementAndGet();
+				}
+				if (flags.running) {
+					fire();
+				}
+			}, ex -> {
+				errors.incrementAndGet();
+				if (flags.running) {
+					fire();
+				}
+			});
+		}
 	}
 
 	static final Flags volatileHolder = new Flags();
