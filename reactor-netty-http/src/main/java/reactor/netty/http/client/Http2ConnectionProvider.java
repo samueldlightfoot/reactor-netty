@@ -201,9 +201,8 @@ final class Http2ConnectionProvider extends PooledConnectionProvider<Connection>
 	static void invalidate(@Nullable ConnectionObserver owner) {
 		if (owner instanceof DisposableAcquire) {
 			DisposableAcquire da = (DisposableAcquire) owner;
-			da.pooledRef
-			  .invalidate()
-			  .subscribe();
+			// Always invoked from a channel handler callback, i.e. on the connection's event loop
+			http2PooledRef(da.pooledRef).invalidateDirect();
 		}
 	}
 
@@ -222,14 +221,12 @@ final class Http2ConnectionProvider extends PooledConnectionProvider<Connection>
 		       .addListener(f -> {
 		           if (owner instanceof DisposableAcquire) {
 		               DisposableAcquire da = (DisposableAcquire) owner;
-		               da.pooledRef
-		                 .invalidate()
-		                 .subscribe(null, null, () -> {
-		                     if (log.isDebugEnabled()) {
-		                         Http2Pool.Http2PooledRef http2PooledRef = http2PooledRef(da.pooledRef);
-		                         logStreamsState(channel, http2PooledRef.slot, "Stream closed");
-		                     }
-		                 });
+		               // The closeFuture listener always runs on the connection's event loop
+		               Http2Pool.Http2PooledRef http2PooledRef = http2PooledRef(da.pooledRef);
+		               http2PooledRef.invalidateDirect();
+		               if (log.isDebugEnabled()) {
+		                   logStreamsState(channel, http2PooledRef.slot, "Stream closed");
+		               }
 		           }
 		       });
 	}

@@ -334,6 +334,19 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 		return mono;
 	}
 
+	void destroyPoolableDirect(Http2PooledRef ref) {
+		assert ref.slot.connection.channel().eventLoop().inEventLoop();
+		try {
+			// By default, check the connection for removal on acquire and invalidate (only if there are no active streams)
+			if (ref.slot.decrementConcurrencyAndGet() == 0) {
+				destroyPoolableInternal(ref);
+			}
+		}
+		catch (Throwable destroyFunctionError) {
+			Operators.onErrorDropped(destroyFunctionError, Context.empty());
+		}
+	}
+
 	void destroyPoolableInternal(Http2PooledRef ref) {
 		// not just a non HTTP/2 connection but also a closed HTTP/2 connection
 		if (ref.slot.http2FrameCodecCtx() == null) {
@@ -443,7 +456,8 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 					if (enableStrictReuse) {
 						slot.deactivate();
 					}
-					eventLoop.execute(this::drain);
+					// No follow-up ("rescue") drain is scheduled here: deliver() drains the pool
+					// after returning the slot to the queue, if borrowers are still pending.
 				}
 				else {
 					if (enableStrictReuse && !belowMinConnections &&
@@ -895,7 +909,18 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				}
 				// ACQUIRED was incremented in drainLoop, rollback
 				ACQUIRED.decrementAndGet(pool);
-				pool.addPending(pool.pending, this, true);
+				ConcurrentLinkedDeque<Borrower> pending = pool.pending;
+				if (pending == TERMINATED) {
+					// Pool disposed concurrently: fail rather than strand the borrower on the shared
+					// static TERMINATED sentinel deque, which nothing ever drains.
+					fail(new PoolShutdownException());
+					return;
+				}
+				pool.addPending(pending, this, true);
+				// The borrower was polled from pending in drainLoop, so pendingOffer's trailing
+				// drain is past; ensure the borrower is re-served. This is also the safety net
+				// that allows drainLoop to skip the rescue drain when pendingSize == 0.
+				pool.drain();
 				return;
 			}
 			stopPendingCountdown(true);
@@ -913,6 +938,11 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 			else {
 				actual.onNext(poolSlot);
 				actual.onComplete();
+			}
+			// Serve borrowers that arrived while this slot was in flight between drainLoop and
+			// deliver (a slot is invisible to findConnection until deactivate() above runs).
+			if (pool.pendingSize != 0) {
+				pool.drain();
 			}
 		}
 
@@ -1003,13 +1033,39 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 						return slot.pool.destroyPoolable(this);
 					}
 					finally {
-						slot.pool.drain();
+						drainIfPending();
 					}
 				}
 				else {
 					return Mono.empty();
 				}
 			});
+		}
+
+		/**
+		 * Synchronous variant of {@link #invalidate()} for callers that are already on the
+		 * connection's event loop (e.g. the stream closeFuture listener): avoids the
+		 * {@code Mono.defer} + {@code subscribe} machinery on the per-request release path.
+		 */
+		void invalidateDirect() {
+			if (compareAndSet(false, true)) {
+				ACQUIRED.decrementAndGet(slot.pool);
+				try {
+					slot.pool.destroyPoolableDirect(this);
+				}
+				finally {
+					drainIfPending();
+				}
+			}
+		}
+
+		void drainIfPending() {
+			// A drained pool with no pending borrowers has nothing to serve; a borrower that
+			// arrives later self-drains via pendingOffer, and a borrower rolled back in
+			// deliver() re-drains directly.
+			if (slot.pool.pendingSize != 0) {
+				slot.pool.drain();
+			}
 		}
 
 		@Override
