@@ -888,7 +888,14 @@ class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.PoolMe
 				}
 				// ACQUIRED was incremented in drainLoop, rollback
 				ACQUIRED.decrementAndGet(pool);
-				pool.addPending(pool.pending, this, true);
+				ConcurrentLinkedDeque<Borrower> pending = pool.pending;
+				if (pending == TERMINATED) {
+					// Pool disposed concurrently: fail rather than strand the borrower on the shared
+					// static TERMINATED sentinel deque, which nothing ever drains.
+					fail(new PoolShutdownException());
+					return;
+				}
+				pool.addPending(pending, this, true);
 				return;
 			}
 			stopPendingCountdown(true);
