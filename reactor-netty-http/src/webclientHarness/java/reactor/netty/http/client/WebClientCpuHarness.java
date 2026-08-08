@@ -24,6 +24,7 @@ import io.netty.pkitesting.X509Bundle;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.MediaType;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.http.server.reactive.HttpHandler;
 import org.springframework.http.server.reactive.ReactorHttpHandlerAdapter;
@@ -78,6 +79,12 @@ public final class WebClientCpuHarness {
 		int bodyBytes = intProp("harness.bodyBytes", 16);
 		String protocol = System.getProperty("harness.protocol", "H2").trim().toUpperCase();
 		boolean tls = boolProp("harness.tls", true);
+		// tasks/select-media-type-percall/client-efficiency-guide.md levers 1+2: declaring `produces`
+		// on the handler lets selectMediaType copy the cached producible-types list instead of walking
+		// every HttpMessageWriter (measured ~13x cheaper); a concrete client Accept keeps the
+		// negotiation's compatible-type list at length 1. Same harness, one flag, so an A/B against the
+		// unoptimized default is apples-to-apples.
+		boolean mediaTypeOptimized = boolProp("harness.mediaTypeOptimized", false);
 		boolean h2 = protocol.startsWith("H2");
 		int maxStreams = intProp("harness.maxStreams", 25);
 		int h2MaxConn = intProp("harness.maxConn", 4);
@@ -108,7 +115,8 @@ public final class WebClientCpuHarness {
 		// Real WebFlux dispatch: @EnableWebFlux wires DispatcherHandler + RequestMappingHandlerMapping/
 		// Adapter exactly as Spring Boot's autoconfiguration would, sourced entirely from spring-context/
 		// spring-webflux/spring-web on the classpath — no spring-boot-starter-webflux dependency needed.
-		AnnotationConfigApplicationContext appCtx = new AnnotationConfigApplicationContext(ServerConfig.class);
+		Class<?> serverConfigClass = mediaTypeOptimized ? ServerConfigOptimized.class : ServerConfig.class;
+		AnnotationConfigApplicationContext appCtx = new AnnotationConfigApplicationContext(serverConfigClass);
 		HttpHandler httpHandler = WebHttpHandlerBuilder.applicationContext(appCtx).build();
 		ReactorHttpHandlerAdapter adapter = new ReactorHttpHandlerAdapter(httpHandler);
 
@@ -160,17 +168,21 @@ public final class WebClientCpuHarness {
 		// Fixed in-flight window of `threads` requests, each re-subscribing the next one from its
 		// completion callback (runs on the client loop) — same shape as HttpCpuHarness's AsyncDriver,
 		// ported onto WebClient's Mono chain. No request ever parks a driver thread.
-		Mono<Integer> oneReq = webClient.get().uri("/").retrieve().bodyToMono(String.class).map(String::length);
+		WebClient.RequestHeadersSpec<?> requestSpec = webClient.get().uri("/");
+		if (mediaTypeOptimized) {
+			requestSpec = requestSpec.accept(MediaType.TEXT_PLAIN);
+		}
+		Mono<Integer> oneReq = requestSpec.retrieve().bodyToMono(String.class).map(String::length);
 		AsyncDriver driver = new AsyncDriver(oneReq, total, measured, errors, volatileHolder);
 		for (int i = 0; i < threads; i++) {
 			driver.fire();
 		}
 
 		int reportConn = h2 ? h2MaxConn : h1MaxConn;
-		System.out.printf("harness up: protocol=%s tls=%b threads=%d conn=%d maxStreams=%s clientLoops=%d " +
+		System.out.printf("harness up: protocol=%s tls=%b mediaTypeOptimized=%b threads=%d conn=%d maxStreams=%s clientLoops=%d " +
 						"serverLoops=%d bodyBytes=%d warmup=%ds window=%ds — attach async-profiler now " +
 						"(cpuh-cli-* / cpuh-srv-* loop threads)%n",
-				proto, tls, threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
+				proto, tls, mediaTypeOptimized, threads, reportConn, h2 ? String.valueOf(maxStreams) : "n/a",
 				clientLoops, serverLoopCount, bodyBytes, warmupSec, durationSec);
 
 		Thread.sleep(warmupSec * 1000L);
@@ -187,8 +199,8 @@ public final class WebClientCpuHarness {
 		double meanLatencyUs = throughput > 0 ? (threads / throughput) * 1_000_000.0 : Double.NaN;
 
 		System.out.println("==== WebClientCpuHarness ====");
-		System.out.printf("protocol=%s tls=%b conn=%d maxStreams=%s threads=%d clientLoops=%d serverLoops=%d bodyBytes=%d%n",
-				proto, tls, reportConn, h2 ? String.valueOf(maxStreams) : "n/a", threads, clientLoops, serverLoopCount, bodyBytes);
+		System.out.printf("protocol=%s tls=%b mediaTypeOptimized=%b conn=%d maxStreams=%s threads=%d clientLoops=%d serverLoops=%d bodyBytes=%d%n",
+				proto, tls, mediaTypeOptimized, reportConn, h2 ? String.valueOf(maxStreams) : "n/a", threads, clientLoops, serverLoopCount, bodyBytes);
 		System.out.printf("window=%.1fs  requests(window)=%d  errors=%d%n", seconds, window, errors.get());
 		System.out.printf("throughput   = %,.0f req/s%n", throughput);
 		System.out.printf("meanLatency  ~ %.1f us  (Little's law: threads / throughput)%n", meanLatencyUs);
@@ -213,6 +225,26 @@ public final class WebClientCpuHarness {
 	@RestController
 	static final class RestEndpoint {
 		@GetMapping("/")
+		Mono<String> get() {
+			return Mono.just(payload);
+		}
+	}
+
+	// mediaTypeOptimized=true arm: declaring `produces` populates HandlerMapping.PRODUCIBLE_MEDIA_TYPES_ATTRIBUTE
+	// at mapping time, so HandlerResultHandlerSupport.selectMediaType copies the cached list instead of
+	// walking every HttpMessageWriter's canWrite/getWritableMediaTypes on every response.
+	@Configuration
+	@EnableWebFlux
+	static class ServerConfigOptimized {
+		@Bean
+		RestEndpointOptimized restEndpoint() {
+			return new RestEndpointOptimized();
+		}
+	}
+
+	@RestController
+	static final class RestEndpointOptimized {
+		@GetMapping(value = "/", produces = MediaType.TEXT_PLAIN_VALUE)
 		Mono<String> get() {
 			return Mono.just(payload);
 		}
