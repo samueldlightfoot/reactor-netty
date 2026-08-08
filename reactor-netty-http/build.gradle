@@ -43,6 +43,12 @@ sourceSets {
 		compileClasspath += sourceSets.main.output
 		runtimeClasspath += sourceSets.main.output
 	}
+	// Isolated from `test`: needs Spring Framework, which requires a JDK17 compile baseline, while
+	// the project toolchain (build.gradle:206) pins `test` to JDK8. See the JDK17 compiler pin below.
+	webclientHarness {
+		compileClasspath += sourceSets.main.output
+		runtimeClasspath += sourceSets.main.output
+	}
 }
 
 configurations {
@@ -55,6 +61,14 @@ configurations {
 	contextPropagationTestRuntimeOnly.extendsFrom(runtimeOnly)
 	http3TestImplementation.extendsFrom(implementation)
 	http3TestRuntimeOnly.extendsFrom(runtimeOnly)
+	webclientHarnessImplementation.extendsFrom(implementation)
+	webclientHarnessRuntimeOnly.extendsFrom(runtimeOnly)
+}
+
+tasks.named('compileWebclientHarnessJava', JavaCompile) {
+	javaCompiler = javaToolchains.compilerFor {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
 }
 
 dependencies {
@@ -198,6 +212,32 @@ dependencies {
 	http3TestRuntimeOnly "org.junit.platform:junit-platform-launcher:$junitPlatformLauncherVersion"
 	http3TestRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:$junitVersion"
 	http3TestRuntimeOnly "ch.qos.logback:logback-classic:$logbackVersion"
+
+	// webclientHarness sourceSet: real Spring WebFlux dispatch (DispatcherHandler/WebClient), built
+	// from a local Spring Framework SNAPSHOT checkout via mavenLocal() (build.gradle:325-335 already
+	// enables it for -SNAPSHOT versions). Must run against THIS module's own reactor-netty-http/-core
+	// (already on the classpath via sourceSets.main.output above), not Spring's transitively-pinned
+	// published copy — exclude it rather than let two copies of reactor-netty/Netty collide.
+	webclientHarnessImplementation("org.springframework:spring-webflux:$springFrameworkVersion") {
+		exclude module: "reactor-netty-http"
+		exclude module: "reactor-netty-core"
+		exclude module: "reactor-netty5-http"
+		exclude group: "io.netty"
+	}
+	// spring-webflux pulls spring-web transitively (WebClient, ReactorHttpHandlerAdapter); spring-context
+	// is separate, needed for @EnableWebFlux + AnnotationConfigApplicationContext.
+	webclientHarnessImplementation "org.springframework:spring-context:$springFrameworkVersion"
+	webclientHarnessImplementation "io.netty:netty-pkitesting:$nettyVersion"
+	// Implementation, not runtimeOnly: the harness source references ch.qos.logback.classic.* by FQN
+	// directly (silenceLogging()), unlike the test sourceSet where logback is compile-visible only via
+	// testFixtures(':reactor-netty-core')'s testFixturesApi exposure, which this sourceSet doesn't pull in.
+	webclientHarnessImplementation "ch.qos.logback:logback-classic:$logbackVersion"
+	// spring-context still resolves org.apache.commons.logging.LogFactory at startup; bridge it to
+	// SLF4J/logback rather than pulling real commons-logging (matches build.gradle:156's testRuntimeOnly).
+	webclientHarnessRuntimeOnly "org.slf4j:jcl-over-slf4j:$slf4jVersion"
+	// Always needed here (unlike the test sourceSet's testToolchain==17 gate above) since this
+	// sourceSet's compiler/launcher are unconditionally pinned to JDK17.
+	webclientHarnessRuntimeOnly "org.bouncycastle:bcpkix-jdk18on:$bouncycastleVersion"
 }
 
 jar {
@@ -223,6 +263,26 @@ task cpuHarness(type: JavaExec) {
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass = 'reactor.netty.http.client.HttpCpuHarness'
 	// Pin the harness JVM to JDK 17 — a JavaExec otherwise inherits the JDK 8 compile toolchain.
+	javaLauncher = javaToolchains.launcherFor {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+	jvmArgs = ['-Xms1g', '-Xmx1g']
+	project.properties.each { k, v ->
+		if (k.startsWith('harness.')) {
+			systemProperty(k, v)
+		}
+	}
+}
+
+// Companion to cpuHarness: genuine Spring WebFlux WebClient/server CPU harness (real DispatcherHandler
+// dispatch, not raw HttpClient/HttpServer) so the client-loop-only profile above can be compared against
+// a full WebClient request cycle. Same -Pharness.* convention. Run:
+//   ./gradlew :reactor-netty-http:webClientHarness -Pharness.protocol=H2 -Pharness.tls=true -Pharness.durationSec=60
+task webClientHarness(type: JavaExec) {
+	group = 'verification'
+	description = 'Genuine WebClient/WebFlux request-cycle CPU harness (real Spring dispatch, not raw HttpClient/HttpServer)'
+	classpath = sourceSets.webclientHarness.runtimeClasspath
+	mainClass = 'reactor.netty.http.client.WebClientCpuHarness'
 	javaLauncher = javaToolchains.launcherFor {
 		languageVersion = JavaLanguageVersion.of(17)
 	}

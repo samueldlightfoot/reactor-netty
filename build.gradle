@@ -137,6 +137,7 @@ ext {
 	errorproneCoreVersion = '2.10.0'
 	errorproneGuavaVersion = '30.0-jre'
 	bouncycastleVersion = '1.85'
+	springFrameworkVersion = '7.1.0-SNAPSHOT' //webClientHarness only, built locally from a pinned fork
 
 	// Antora
 	antoraPluginVersion = '1.0.0'
